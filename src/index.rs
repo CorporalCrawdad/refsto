@@ -1,7 +1,6 @@
 use std::time::SystemTime;
-use sqlx::{SqlitePool, Row};
+use sqlx::{SqlitePool, Row, sqlite::SqliteQueryResult};
 use tokio::fs::metadata;
-use tokio_stream::StreamExt;
 
 struct HashIndexer {
     db_con_pool: sqlx::SqlitePool,
@@ -20,24 +19,29 @@ impl HashIndexer {
         Ok(HashIndexer{db_con_pool, hasher})
     }
 
-    pub async fn update(self, filepath: &str) -> Result<(), anyhow::Error> {
+    pub async fn update(self, filepath: &str) -> Result<SqliteQueryResult, anyhow::Error> {
         let meta = metadata(filepath).await?;
-        let filesize = meta.len();
+        let filesize = meta.len() as i64;
         let lastmod = match meta.modified() {
-            Ok(time) => time.duration_since(SystemTime::UNIX_EPOCH).unwrap(),
-            Err(_) => SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+            Ok(time) => time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64,
+            Err(_) => SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64,
         };
         // check heuristic diff before updating hash
         // if lastmod or filesize different, rehash
         let mut conn = self.db_con_pool.acquire().await?;
-        let mut rows = sqlx::query("SELECT (phash, filesize, lastmod) FROM entries WHERE filepath = ?").bind(filepath).fetch(&mut conn);
-        while let Some(row) = rows.try_next().await? {
-            let (db_filepath, db_phash, db_filesize, db_lastmod): (&str, &[u8], u32, &[u8]) = (row.try_get("filepath")?, row.try_get("phash")?, row.try_get("filesize")?, row.try_get("lastmod")?);
-            if db_lastmod != lastmod || db_filesize != filesize {
-
+        if let Ok(rows) = sqlx::query("SELECT (phash, filesize, lastmod) FROM entries WHERE filepath = ?").bind(filepath).fetch_all(&mut conn).await {
+            if rows.len() > 0 { // filepath already in db, conditionally compute hash and update
+                if rows.len() > 1 {
+                    return Err(anyhow::anyhow!("Multiple entries for {filepath} in db"));
+                } else {
+                    let (db_filesize, db_lastmod): (i64, i64) = (rows[0].try_get("filesize")?, rows[0].try_get("lastmod")?);
+                    if db_filesize == filesize && db_lastmod == lastmod {
+                        return Ok(SqliteQueryResult::default());
+                    }
+                }
             }
         }
-        let phash = self.hasher.hash_image(&img_hash::image::open(filepath)?).as_bytes();
-        Ok(())
+        let phash = self.hasher.hash_image(&img_hash::image::open(filepath)?).as_bytes().to_owned();
+        sqlx::query("INSERT OR REPLACE INTO entries (? ? ? ?)").bind(filepath).bind(phash).bind(filesize).bind(lastmod).execute(&mut conn).await.or_else(|x| Err(anyhow::anyhow!(x)))
     }
 }

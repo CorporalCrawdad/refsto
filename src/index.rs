@@ -1,7 +1,6 @@
 use std::time::SystemTime;
-use sqlx::{Connection, SqlitePool, Row};
-use img_hash::ImageHash;
-use tokio::{fs::{File,metadata}, io::{AsyncReadExt, BufReader}};
+use sqlx::{SqlitePool, Row};
+use tokio::fs::metadata;
 use tokio_stream::StreamExt;
 
 struct HashIndexer {
@@ -22,7 +21,6 @@ impl HashIndexer {
     }
 
     pub async fn update(self, filepath: &str) -> Result<(), anyhow::Error> {
-        // let file = File::open(filepath).await?;
         let meta = metadata(filepath).await?;
         let filesize = meta.len();
         let lastmod = match meta.modified() {
@@ -35,6 +33,9 @@ impl HashIndexer {
         let mut rows = sqlx::query("SELECT (phash, filesize, lastmod) FROM entries WHERE filepath = ?").bind(filepath).fetch(&mut conn);
         while let Some(row) = rows.try_next().await? {
             let (db_filepath, db_phash, db_filesize, db_lastmod): (&str, &[u8], u32, &[u8]) = (row.try_get("filepath")?, row.try_get("phash")?, row.try_get("filesize")?, row.try_get("lastmod")?);
+            if db_lastmod != lastmod || db_filesize != filesize {
+
+            }
         }
         let phash = self.hasher.hash_image(&img_hash::image::open(filepath)?).as_bytes();
         Ok(())

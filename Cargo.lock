@@ -1197,20 +1197,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glowie"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eframe",
- "egui_extras",
- "image 0.24.6",
- "img_hash",
- "sqlx",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "glutin"
 version = "0.30.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2242,6 +2228,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "567664f262709473930a4bf9e51bf2ebf3348f2e748ccc50dea20646858f8f29"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "refsto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui_extras",
+ "image 0.24.6",
+ "img_hash",
+ "sqlx",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

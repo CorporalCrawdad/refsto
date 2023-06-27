@@ -90,13 +90,15 @@ impl Glowie {
         }
     }
 
-    fn spawn_next_pic(&mut self){
-        let path = self.filelist[self.fileindex].clone();
-        let tx = self.image_tx.clone();
-        self.rt.spawn(async move {
-            Self::load_pic(path, tx).await;
-        });
-        self.loading = true;
+    fn spawn_next_pic(&mut self) {
+        if let Some(path) = self.filelist.get(self.fileindex) {
+            let tx = self.image_tx.clone();
+            let path = path.clone();
+            self.rt.spawn(async move {
+                Self::load_pic(path, tx).await;
+            });
+            self.loading = true;
+        }
     }
 }
 

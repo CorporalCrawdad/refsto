@@ -1,7 +1,6 @@
 use eframe::egui;
-use egui_extras::RetainedImage;
 use tokio::runtime;
-use std::{sync::{mpsc::{channel, Receiver, Sender}, Arc, Mutex}, path::{Path,PathBuf}, cell::RefCell};
+use std::{sync::{{Arc, Mutex}}, path::{Path,PathBuf}};
 
 pub struct IndexingGui {
     filelist: Arc<Mutex<Option<Vec<PathBuf>>>>,
@@ -10,7 +9,7 @@ pub struct IndexingGui {
 
 impl IndexingGui {
     pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>) -> Self {
-        let mut ig = IndexingGui { filelist: Arc::new(Mutex::new(None)), rt: tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap() };
+        let ig = IndexingGui { filelist: Arc::new(Mutex::new(None)), rt: tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap() };
         let fl_handle = ig.filelist.clone();
         let path = path.into();
         ig.rt.spawn(async move {

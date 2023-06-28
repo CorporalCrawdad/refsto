@@ -18,15 +18,37 @@ impl IndexingGui {
         ig
     }
 
-    async fn load_filelist(path: impl AsRef<Path> + std::marker::Send, filelist: Arc<Mutex<Option<Vec<PathBuf>>>>) {
-        let path = path.as_ref();
+    async fn load_filelist(path: impl Into<PathBuf> + std::marker::Send, filelist: Arc<Mutex<Option<Vec<PathBuf>>>>) {
+        let path: PathBuf = path.into();
         if path.is_dir() {
-            match std::fs::read_dir(path) {
-                Ok(readdir) => {
-                    *filelist.lock().unwrap() = Some(readdir.filter(|entry| entry.is_ok() && entry.as_ref().unwrap().file_type().unwrap().is_file()).flatten().map(|entry| entry.path()).collect());
-                },
-                Err(_) => panic!("Could not open directory {}", path.display()),
+            let mut dirlist: _ = vec![path.into()];
+            let mut found_files: _ = vec![];
+            while let Some(dir_to_check) = dirlist.pop() {
+                match std::fs::read_dir(dir_to_check) {
+                    Ok(readdir) => {
+                        for entry in readdir {
+                            if let Ok(entry) = entry {
+                                if let Ok(ft) = entry.file_type() {
+                                    if ft.is_dir() {
+                                        dirlist.push(entry.path());
+                                    } else if ft.is_file() {
+                                        found_files.push(entry.path());
+                                    }
+                                }
+                            }
+                        }
+                        // *filelist.lock().unwrap() = Some(readdir.filter(|entry| entry.is_ok() && entry.as_ref().unwrap().file_type().unwrap().is_file()).flatten().map(|entry| entry.path()).collect());
+                    },
+                    Err(error) => {
+                        if found_files.len() == 0 {
+                            panic!("{}", error);
+                        } else {
+                            eprintln!("{}", error);
+                        }
+                    },
+                }
             }
+            *filelist.lock().unwrap() = Some(found_files);
         }
     }
 }
@@ -38,7 +60,8 @@ impl eframe::App for IndexingGui {
             match lock {
                 Ok(mutguard) => {
                     if let Some(filelist) = &*mutguard {
-                        for path in filelist {
+                        ui.add(egui::Label::new(format!("Found {} files...", filelist.len())));
+                        for path in filelist.into_iter().take(100) {
                             ui.add(egui::Label::new(path.as_path().to_string_lossy()));
                         }
                     } else {

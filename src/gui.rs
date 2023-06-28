@@ -1,6 +1,6 @@
 use eframe::egui;
 use tokio::runtime;
-use std::{sync::{{Arc, Mutex}}, path::{Path,PathBuf}};
+use std::{sync::{{Arc, Mutex}}, path::PathBuf};
 
 pub struct IndexingGui {
     filelist: Arc<Mutex<Option<Vec<PathBuf>>>>,

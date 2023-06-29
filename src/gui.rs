@@ -1,22 +1,25 @@
 use eframe::egui;
 use tokio::runtime;
-use std::{sync::{{Arc, RwLock}}, path::PathBuf};
+use std::{sync::{{Arc, RwLock}, Mutex, atomic::AtomicBool}, path::PathBuf};
 
 use crate::index::HashIndexer;
 
 pub struct IndexingGui {
     filelist: Arc<RwLock<Option<Vec<PathBuf>>>>,
     rt: Box<Arc<runtime::Runtime>>,
+    done: Arc<AtomicBool>,
 }
 
 impl IndexingGui {
     pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>, rt: Box<Arc<runtime::Runtime>>, db_pool: sqlx::SqlitePool) -> Self {
-        let ig = IndexingGui { filelist: Arc::new(RwLock::new(None)), rt};
+        let ig = IndexingGui { filelist: Arc::new(RwLock::new(None)), rt, done: Arc::new(AtomicBool::new(false))};
         let fl_handle = ig.filelist.clone();
+        let done_handle = ig.done.clone();
         let path = path.into();
         ig.rt.spawn(async move {
             Self::load_filelist(path, fl_handle.clone()).await;
             Self::update_filelist(fl_handle.clone(), db_pool.clone()).await.unwrap();
+            done_handle.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         ig
     }
@@ -56,18 +59,26 @@ impl IndexingGui {
 
     async fn update_filelist(filelist: Arc<RwLock<Option<Vec<PathBuf>>>>, db_pool: sqlx::SqlitePool) -> Result<(), anyhow::Error> {
         let hi = HashIndexer::new(db_pool);
-        let lock = filelist.read();
         let mut fut_set = vec!();
-        if let Ok(lock) = lock {
-            if let Some(filelist) = &*lock {
-                for entry in filelist {
-                    let entry = entry.to_str().unwrap();
-                    fut_set.push(hi.update(String::from(entry)));
+        {
+            let lock = filelist.read();
+            if let Ok(lock) = lock {
+                if let Some(filelist) = &*lock {
+                    for entry in filelist {
+                        let entry = entry.to_str().unwrap();
+                        fut_set.push(hi.update(String::from(entry)));
+                    }
                 }
+            } else {
+                println!("Couldn't lock filelist!");
             }
-        } else {
-            println!("Couldn't lock filelist!");
         }
+        for future in fut_set {
+            if let Err(e) = future.await{
+                eprintln!("{}", e);
+            }
+        }
+        println!("Finished updating file hashes into database!");
         Ok(())
     }
 }

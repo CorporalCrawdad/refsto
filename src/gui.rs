@@ -1,6 +1,6 @@
 use eframe::egui;
 use tokio::runtime;
-use std::{sync::{{Arc, RwLock}, Mutex, atomic::AtomicBool}, path::PathBuf};
+use std::{sync::{{Arc, RwLock}, atomic::AtomicBool}, path::PathBuf};
 
 use crate::index::HashIndexer;
 
@@ -73,12 +73,12 @@ impl IndexingGui {
                 println!("Couldn't lock filelist!");
             }
         }
-        for future in fut_set {
-            if let Err(e) = future.await{
-                eprintln!("{}", e);
-            }
-        }
-        println!("Finished updating file hashes into database!");
+        // for future in fut_set {
+        //     if let Err(e) = future.await{
+        //         eprintln!("{}", e);
+        //     }
+        // }
+        let _ = futures::future::join_all(fut_set).await;
         Ok(())
     }
 }

@@ -1,24 +1,27 @@
 use eframe::egui;
 use tokio::runtime;
-use std::{sync::{{Arc, Mutex}}, path::PathBuf};
+use std::{sync::{{Arc, RwLock}}, path::PathBuf};
+
+use crate::index::HashIndexer;
 
 pub struct IndexingGui {
-    filelist: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    rt: runtime::Runtime,
+    filelist: Arc<RwLock<Option<Vec<PathBuf>>>>,
+    rt: Box<Arc<runtime::Runtime>>,
 }
 
 impl IndexingGui {
-    pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>) -> Self {
-        let ig = IndexingGui { filelist: Arc::new(Mutex::new(None)), rt: tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap() };
+    pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>, rt: Box<Arc<runtime::Runtime>>, db_pool: sqlx::SqlitePool) -> Self {
+        let ig = IndexingGui { filelist: Arc::new(RwLock::new(None)), rt};
         let fl_handle = ig.filelist.clone();
         let path = path.into();
         ig.rt.spawn(async move {
-            Self::load_filelist(path, fl_handle).await;
+            Self::load_filelist(path, fl_handle.clone()).await;
+            Self::update_filelist(fl_handle.clone(), db_pool.clone()).await.unwrap();
         });
         ig
     }
 
-    async fn load_filelist(path: impl Into<PathBuf> + std::marker::Send, filelist: Arc<Mutex<Option<Vec<PathBuf>>>>) {
+    async fn load_filelist(path: impl Into<PathBuf> + std::marker::Send, filelist: Arc<RwLock<Option<Vec<PathBuf>>>>) {
         let path: PathBuf = path.into();
         if path.is_dir() {
             let mut dirlist: _ = vec![path.into()];
@@ -37,7 +40,6 @@ impl IndexingGui {
                                 }
                             }
                         }
-                        // *filelist.lock().unwrap() = Some(readdir.filter(|entry| entry.is_ok() && entry.as_ref().unwrap().file_type().unwrap().is_file()).flatten().map(|entry| entry.path()).collect());
                     },
                     Err(error) => {
                         if found_files.len() == 0 {
@@ -48,20 +50,37 @@ impl IndexingGui {
                     },
                 }
             }
-            *filelist.lock().unwrap() = Some(found_files);
+            *filelist.write().unwrap() = Some(found_files);
         }
+    }
+
+    async fn update_filelist(filelist: Arc<RwLock<Option<Vec<PathBuf>>>>, db_pool: sqlx::SqlitePool) -> Result<(), anyhow::Error> {
+        let hi = HashIndexer::new(db_pool);
+        let lock = filelist.read();
+        let mut fut_set = vec!();
+        if let Ok(lock) = lock {
+            if let Some(filelist) = &*lock {
+                for entry in filelist {
+                    let entry = entry.to_str().unwrap();
+                    fut_set.push(hi.update(String::from(entry)));
+                }
+            }
+        } else {
+            println!("Couldn't lock filelist!");
+        }
+        Ok(())
     }
 }
 
 impl eframe::App for IndexingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let lock = self.filelist.try_lock();
+            let lock = self.filelist.try_read();
             match lock {
                 Ok(mutguard) => {
                     if let Some(filelist) = &*mutguard {
                         ui.add(egui::Label::new(format!("Found {} files...", filelist.len())));
-                        for path in filelist.into_iter().take(100) {
+                        for path in filelist.into_iter().take(10) {
                             ui.add(egui::Label::new(path.as_path().to_string_lossy()));
                         }
                     } else {

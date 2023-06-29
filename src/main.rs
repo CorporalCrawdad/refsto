@@ -1,10 +1,14 @@
 mod gui;
 mod index;
-use crate::gui::IndexingGui;
+use std::sync::Arc;
+use gui::IndexingGui;
+use sqlx::SqlitePool;
+use tokio::runtime;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(1).unwrap_or(&String::from("./")).to_owned();
-    let _ = eframe::run_native("Computing directory hashes...", eframe::NativeOptions::default(), Box::new(|cc| Box::new(IndexingGui::new(cc, dir))));
-    // let _ = eframe::run_native("Glowie", eframe::NativeOptions::default(), Box::new(|cc| Box::new(Glowie::new(cc, dir))));
+    let rt = Box::new(Arc::new(runtime::Builder::new_multi_thread().enable_time().build().unwrap()));
+    let db_pool = rt.block_on(SqlitePool::connect(format!("sqlite:glowie.db").as_str())).unwrap();
+    let _ = eframe::run_native("Computing directory hashes...", eframe::NativeOptions::default(), Box::new(|cc| Box::new(IndexingGui::new(cc, dir, rt, db_pool))));
 }

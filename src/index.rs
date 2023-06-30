@@ -6,15 +6,25 @@ pub struct HashIndexer {
     // hasher: img_hash::Hasher,   
 }
 
+pub enum HashIndexError {
+    Format,
+    Encoding,
+    MalformedDB,
+    Other,
+}
+
 impl HashIndexer {
     pub fn new(db_pool: sqlx::SqlitePool) -> Self {
         // let hasher = img_hash::HasherConfig::new().to_hasher();
         HashIndexer{db_pool}
     }
 
-    pub async fn update(&self, filepath: String) -> Result<SqliteQueryResult, anyhow::Error> {
+    pub async fn update(&self, filepath: String) -> Result<SqliteQueryResult, HashIndexError> {
         let filepath = filepath.as_str();
-        let meta = metadata(filepath).await?;
+        let meta = { match metadata(filepath).await {
+            Ok(x) => x,
+            Err(_) => return Err(HashIndexError::Other),
+        }};
         let filesize = meta.len() as i64;
         let lastmod = match meta.modified() {
             Ok(time) => time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64,
@@ -31,9 +41,9 @@ impl HashIndexer {
         if let Ok(rows) = sqlx::query("SELECT phash, filesize, lastmod FROM entries WHERE filepath = ?").bind(filepath).fetch_all(&mut conn).await {
             if rows.len() > 0 { // filepath already in db, conditionally compute hash and update
                 if rows.len() > 1 {
-                    return Err(anyhow::anyhow!("Multiple entries for {} in db", &filepath));
+                    return Err(HashIndexError::MalformedDB);
                 } else {
-                    let (db_filesize, db_lastmod): (i64, i64) = (rows[0].try_get("filesize")?, rows[0].try_get("lastmod")?);
+                    let (db_filesize, db_lastmod): (i64, i64) = (rows[0].try_get("filesize").unwrap(), rows[0].try_get("lastmod").unwrap());
                     if db_filesize == filesize && db_lastmod == lastmod {
                         return Ok(SqliteQueryResult::default());
                     }
@@ -42,16 +52,16 @@ impl HashIndexer {
             }
         }
         async move {
-            let img_bytes = image::io::Reader::open(filepath)?.with_guessed_format()?.decode();
+            let img_bytes = image::io::Reader::open(filepath).unwrap().with_guessed_format().unwrap().decode();
             match img_bytes {
                 Ok(img_bytes) => {
                     let phash = image_hasher::HasherConfig::new().to_hasher().hash_image(&img_bytes).to_base64();
-                    sqlx::query("INSERT OR REPLACE INTO entries (filepath, phash, filesize, lastmod) VALUES (?, ?, ?, ?)").bind(filepath).bind(phash).bind(filesize).bind(lastmod).execute(&mut conn).await.or_else(|x| Err(anyhow::anyhow!(x)))
+                    sqlx::query("INSERT OR REPLACE INTO entries (filepath, phash, filesize, lastmod) VALUES (?, ?, ?, ?)").bind(filepath).bind(phash).bind(filesize).bind(lastmod).execute(&mut conn).await.or_else(|_| Err(HashIndexError::Other))
                 },
-                Err(err) => {
-                    eprintln!("Couldn't open image {}: {:?}", filepath, err);
-                    Err(anyhow::anyhow!(err))
-                }
+                Err(image::ImageError::Unsupported(_)) => return Err(HashIndexError::Format),
+                Err(image::ImageError::IoError(_)) => return Err(HashIndexError::Encoding),
+                Err(image::ImageError::Decoding(_)) => return Err(HashIndexError::Encoding),
+                Err(_) => panic!(),
             }
         }.await
     }

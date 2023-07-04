@@ -6,6 +6,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use tokio::runtime;
 
 const SQLITE_CON_CNT: u32 = 2048;
+const HASH_SIZE_BYTES: usize = 8;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

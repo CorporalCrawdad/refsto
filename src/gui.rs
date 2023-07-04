@@ -29,6 +29,12 @@ pub struct IndexingGui {
     hash_track: Arc<HashTracker>,
     cancel_token: CancellationToken,
     checkmark: RetainedImage,
+    db_pool: sqlx::SqlitePool,
+    dupes_started: AtomicBool,
+    dupes_checked: Arc<AtomicBool>,
+    hash_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>,
+    bin_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>,
+    hamming_proximity: usize,
 }
 
 impl IndexingGui {
@@ -39,6 +45,12 @@ impl IndexingGui {
             hash_track: Arc::new(HashTracker::new()),
             cancel_token: CancellationToken::new(),
             checkmark: RetainedImage::from_image_bytes("checkmark", CHECKMARK).unwrap(),
+            db_pool: db_pool.clone(),
+            hash_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
+            bin_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
+            dupes_started: AtomicBool::new(false),
+            dupes_checked: Arc::new(AtomicBool::new(false)),
+            hamming_proximity: 0,
         };
         let fl_handle = ig.filelist.clone();
         let done_handle = ig.hash_track.clone();
@@ -90,8 +102,7 @@ impl IndexingGui {
         // let mut fut_set = vec!();
         let mut fut_set = FuturesUnordered::new();
         {
-            let lock = filelist.read();
-            if let Ok(lock) = lock {
+            if let Ok(lock) = filelist.read() {
                 if let Some(filelist) = &*lock {
                     for entry in filelist {
                         let entry = entry.to_str().unwrap();
@@ -111,11 +122,12 @@ impl IndexingGui {
         hash_track.to_hash.store(fut_set.len(), Relaxed);
         // let _ = futures::future::join_all(fut_set).await;
         while let Some(result) = fut_set.next().await {
+            hash_track.hashed.fetch_add(1, Relaxed);
             if cancel_token.is_cancelled() {
                 return Err(anyhow::anyhow!("hashing futures cancelled before completion"));
             } else {
                 match result {
-                    Ok(_) => {hash_track.hashed.fetch_add(1, Relaxed);},
+                    Ok(_) => {},
                     Err(HashIndexError::Format) => {hash_track.bad_format.fetch_add(1, Relaxed);},
                     Err(HashIndexError::Encoding) => {hash_track.bad_encode.fetch_add(1, Relaxed);},
                     Err(_) => (),
@@ -125,35 +137,82 @@ impl IndexingGui {
         println!("DB updates completed.");
         Ok(())
     }
+
+    fn spawn_find_dupes(rt_handle: &runtime::Handle, cancel_token: CancellationToken, db_pool: sqlx::SqlitePool, hash_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, hamming_proximity: usize, done_flag: Arc<AtomicBool>) {
+        rt_handle.spawn(async move {
+            let hi = HashIndexer::new(db_pool);
+            hi.cluster(hash_dupes, bin_dupes, hamming_proximity, cancel_token).await;
+            done_flag.store(true, Relaxed);
+        });
+    }
 }
 
 impl eframe::App for IndexingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let lock = self.filelist.try_read();
-            match lock {
+            match self.filelist.try_read() {
                 Ok(mutguard) => {
                     if let Some(filelist) = &*mutguard {
-                        ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
-                        ui.label(format!("File list loaded! Found {} files...", filelist.len()));
-                        if self.hash_track.done_hashing.load(Relaxed) {
+                        ui.horizontal(|ui| {
                             ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
-                            ui.label(format!("Hashing complete for {} files", self.hash_track.hashed.load(Relaxed)));
-                        } else {
-                            ui.spinner();
-                            ui.label(format!("Hashing files... {}/{}", self.hash_track.hashed.load(Relaxed), self.hash_track.to_hash.load(Relaxed)));
-                            if self.hash_track.bad_encode.load(Relaxed) > 0 {
-                                ui.label(format!("BAD ENCODED FILES ENCOUNTERED! Malformed pictures cannot be hashed, try fixing with imagemagick and re-run."));
+                            ui.label(format!("File list loaded! Found {} files...", filelist.len()));
+                        });
+                        if self.hash_track.done_hashing.load(Relaxed) {
+                            ui.horizontal(|ui| {
+                                ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
+                                ui.label(format!("Hashing complete for {} files", self.hash_track.hashed.load(Relaxed)));
+                            });
+                            if self.dupes_checked.load(Relaxed) {
+                                match (self.hash_dupes.try_read(), self.bin_dupes.try_read()) {
+                                    (Ok(hash_dupes), Ok(bin_dupes)) => {
+                                        ui.horizontal(|ui| {
+                                            self.dupes_started.store(false, Relaxed);
+                                            ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
+                                            ui.label(format!("Found {} sets of images with at least one duplication.", hash_dupes.len()+bin_dupes.len()));
+                                        });
+                                        for set in hash_dupes.iter().chain(bin_dupes.iter()) {
+                                            ui.label(format!("DUPLICATE SET: (len {})\t{:?}", set.len(), set.join(", ")));
+                                        }
+                                    },
+                                    (_,_) => {
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new());
+                                            ui.add(egui::Label::new("Comparing for binary duplicates and visually identical images..."));
+                                        });
+                                    },
+                                }
                             }
+                            if !self.dupes_started.load(Relaxed) {
+                                ui.add(egui::Slider::new(&mut self.hamming_proximity, 0..=100).text("Similarity"));
+                                if ui.button(format!("Search database for images with {}% difference.", self.hamming_proximity)).clicked() {
+                                    self.dupes_started.store(true, Relaxed);
+                                    self.dupes_checked.store(false, Relaxed);
+                                    self.hash_dupes = Arc::new(tokio::sync::RwLock::new(vec!()));
+                                    self.bin_dupes = Arc::new(tokio::sync::RwLock::new(vec!()));
+                                    Self::spawn_find_dupes(self.rt.handle(), self.cancel_token.clone(), self.db_pool.clone(), self.hash_dupes.clone(), self.bin_dupes.clone(), self.hamming_proximity, self.dupes_checked.clone());
+                                }
+                            }
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Hashing files... {}/{}", self.hash_track.hashed.load(Relaxed), self.hash_track.to_hash.load(Relaxed)));
+                                if self.hash_track.bad_encode.load(Relaxed) > 0 {
+                                    ui.label(format!("BAD ENCODED FILES ENCOUNTERED! Malformed pictures cannot be hashed, try fixing with imagemagick and re-run."));
+                                }
+                            });
                         }
                     } else {
-                        ui.add(egui::Spinner::new());
-                        ui.add(egui::Label::new("Loading filelist..."));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.add(egui::Label::new("Loading filelist..."));
+                        });
                     }
                 },
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    ui.add(egui::Spinner::new());
-                    ui.add(egui::Label::new("Loading filelist..."));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.add(egui::Label::new("Loading filelist..."));
+                    });
                 },
                 Err(_) => panic!(),
             }

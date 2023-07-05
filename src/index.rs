@@ -1,8 +1,9 @@
 use std::{time::SystemTime, path::Path, fs::File, io::{BufReader, Read}, sync::Arc};
 use futures::{stream::FuturesUnordered, StreamExt};
-use sqlx::{Row, sqlite::SqliteQueryResult};
+use sqlx::{Row, sqlite::SqliteQueryResult, Acquire};
 use tokio::{fs::metadata, sync::RwLock};
 use tokio_util::sync::CancellationToken;
+
 pub struct HashIndexer {
     db_pool: sqlx::SqlitePool,
     // hasher: img_hash::Hasher,   
@@ -21,7 +22,7 @@ impl HashIndexer {
         HashIndexer{db_pool}
     }
 
-    pub async fn update(&self, filepath: String) -> Result<SqliteQueryResult, HashIndexError> {
+    pub async fn update(&self, filepath: String, tasknum: usize) -> Result<SqliteQueryResult, HashIndexError> {
         let filepath = filepath.as_str();
         let meta = { match metadata(filepath).await {
             Ok(x) => x,
@@ -35,11 +36,11 @@ impl HashIndexer {
         // check heuristic diff before updating hash
         // if lastmod or filesize different, rehash
         let mut conn = loop {
-            if let Ok(acquisition) = self.db_pool.acquire().await {
+            if let Ok(mut acquisition) = self.db_pool.acquire().await {
                 break acquisition;
             }
         };
-        if let Ok(rows) = sqlx::query("SELECT phash, filesize, lastmod FROM entries WHERE filepath = ?").bind(filepath).fetch_all(&mut conn).await {
+        if let Ok(rows) = sqlx::query("SELECT phash, filesize, lastmod FROM entries WHERE filepath = ?").bind(filepath).fetch_all(conn.acquire().await.unwrap()).await {
             if rows.len() > 0 { // filepath already in db, conditionally compute hash and update
                 if rows.len() > 1 {
                     return Err(HashIndexError::MalformedDB);
@@ -52,19 +53,24 @@ impl HashIndexer {
             } else {
             }
         }
-        async move {
+        let res = async move {
             let img_bytes = image::io::Reader::open(filepath).unwrap().with_guessed_format().unwrap().decode();
             match img_bytes {
                 Ok(img_bytes) => {
                     let phash = image_hasher::HasherConfig::with_bytes_type::<[u8; crate::HASH_SIZE_BYTES]>().to_hasher().hash_image(&img_bytes).to_base64();
-                    sqlx::query("INSERT OR REPLACE INTO entries (filepath, phash, filesize, lastmod) VALUES (?, ?, ?, ?)").bind(filepath).bind(phash).bind(filesize).bind(lastmod).execute(&mut conn).await.or_else(|_| Err(HashIndexError::Other))
+                    println!("Task {} hashing complete", tasknum);
+                    let res = sqlx::query("INSERT OR REPLACE INTO entries (filepath, phash, filesize, lastmod) VALUES (?, ?, ?, ?)").bind(filepath).bind(phash).bind(filesize).bind(lastmod).execute(conn.acquire().await.unwrap()).await.or_else(|_| Err(HashIndexError::Other));
+                    println!("Task {} query completed", tasknum);
+                    res
                 },
                 Err(image::ImageError::Unsupported(_)) => return Err(HashIndexError::Format),
                 Err(image::ImageError::IoError(_)) => return Err(HashIndexError::Encoding),
                 Err(image::ImageError::Decoding(_)) => return Err(HashIndexError::Encoding),
                 Err(_) => panic!(),
             }
-        }.await
+        }.await;
+        println!("Task {} complete", tasknum);
+        res
     }
 
     pub async fn find_dupes(&self, hash_dupes: Arc<RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<RwLock<Vec<Vec<String>>>>, cancel_token: CancellationToken) {
@@ -76,11 +82,11 @@ impl HashIndexer {
 
         // get hash dupes
         let mut hash_dupes = hash_dupes.write().await;
-        if let Ok(groupby_result) = sqlx::query("SELECT phash, COUNT(rowid) as collisioncnt FROM entries GROUP BY phash HAVING collisioncnt > 1;").fetch_all(&mut conn).await {
+        if let Ok(groupby_result) = sqlx::query("SELECT phash, COUNT(rowid) as collisioncnt FROM entries GROUP BY phash HAVING collisioncnt > 1;").fetch_all(conn.acquire().await.unwrap()).await {
             for row in groupby_result {
                 let phash: String = row.get("phash");
                 let mut filepaths: Vec<String> = vec!();
-                if let Ok(collided_filenames) = sqlx::query("SELECT filepath FROM entries WHERE phash = ?;").bind(&phash).fetch_all(&mut conn).await {
+                if let Ok(collided_filenames) = sqlx::query("SELECT filepath FROM entries WHERE phash = ?;").bind(&phash).fetch_all(conn.acquire().await.unwrap()).await {
                     for row in collided_filenames {
                         filepaths.push(row.get("filepath"));
                     }

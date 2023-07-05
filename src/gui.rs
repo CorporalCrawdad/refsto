@@ -99,14 +99,16 @@ impl IndexingGui {
 
     async fn update_filelist(filelist: Arc<RwLock<Option<Vec<PathBuf>>>>, db_pool: sqlx::SqlitePool, hash_track: Arc<HashTracker>, cancel_token: CancellationToken) -> Result<(), anyhow::Error> {
         let hi = HashIndexer::new(db_pool);
+        let mut tasknum = 0;
         // let mut fut_set = vec!();
-        let mut fut_set = FuturesUnordered::new();
+        let mut fut_set = futures::stream::FuturesUnordered::new();
         {
             if let Ok(lock) = filelist.read() {
                 if let Some(filelist) = &*lock {
                     for entry in filelist {
                         let entry = entry.to_str().unwrap();
-                        fut_set.push(hi.update(String::from(entry)));
+                        fut_set.push_back(hi.update(String::from(entry), tasknum));
+                        tasknum += 1;
                     }
                 }
             } else {
@@ -120,8 +122,11 @@ impl IndexingGui {
         // }
         println!("Starting {} update tasks...", fut_set.len());
         hash_track.to_hash.store(fut_set.len(), Relaxed);
+        tasknum = 0;
         // let _ = futures::future::join_all(fut_set).await;
         while let Some(result) = fut_set.next().await {
+            println!("Received future {}", tasknum);
+            tasknum += 1;
             hash_track.hashed.fetch_add(1, Relaxed);
             if cancel_token.is_cancelled() {
                 return Err(anyhow::anyhow!("hashing futures cancelled before completion"));

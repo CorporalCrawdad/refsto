@@ -9,7 +9,7 @@ edition = "2021"
 eframe = { version="0.22.0", features=["wayland"] }
 egui_extras = {version="0.22.0", features=["image"]}
 tokio = {version="1.28.2", features=["full"]}
-sqlx = {version="0.6.2", features=["runtime-tokio-native-tls", "sqlite", "offline"]}
+sqlx = {version="0.7.0", features=["runtime-tokio-native-tls", "sqlite"]}
 image_hasher = "1.1.0"
 anyhow = "1.0.71"
 tokio-stream = "0.1.14"

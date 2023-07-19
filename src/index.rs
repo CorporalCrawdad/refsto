@@ -1,8 +1,11 @@
-use std::{time::SystemTime, path::Path, fs::File, io::{BufReader, Read}, sync::Arc};
-use futures::{stream::FuturesUnordered, StreamExt};
+use std::{time::{SystemTime, Duration}, path::Path, fs::File, io::{BufReader, Read}, sync::Arc};
+use futures::stream::FuturesUnordered;
 use sqlx::{Row, sqlite::SqliteQueryResult, Acquire};
 use tokio::{fs::metadata, sync::RwLock};
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
+
+use crate::HASH_SIZE_BYTES;
 
 pub struct HashIndexer {
     db_pool: sqlx::SqlitePool,
@@ -98,7 +101,7 @@ impl HashIndexer {
             }
         }
 
-        let mut fut_set = FuturesUnordered::new();
+        let fut_set = FuturesUnordered::new();
         let mut bin_dupes = bin_dupes.write().await;
         for dupe_set in (&hash_dupes).iter() {
             let dupe_set = dupe_set.clone();
@@ -117,7 +120,8 @@ impl HashIndexer {
                 exact_matches
             });
         }
-        while let Some(result) = fut_set.next().await {
+        let mut fut_set = fut_set.timeout_repeating(tokio::time::interval(Duration::from_secs(5)));
+        while let Ok(Some(result)) = fut_set.try_next().await {
             if cancel_token.is_cancelled() {
                 break;
             }
@@ -132,7 +136,14 @@ impl HashIndexer {
 
     pub async fn cluster(&self, hash_dupes: Arc<RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<RwLock<Vec<Vec<String>>>>, hamming_range: usize, cancel_token: CancellationToken) {
         // Hamming range provided as 0 - 100 percentile difference.
-        self.find_dupes(hash_dupes, bin_dupes, cancel_token).await;
+        // self.find_dupes(hash_dupes, bin_dupes, cancel_token).await;
+        let hamming_distance = (hamming_range * HASH_SIZE_BYTES) / 100;
+
+        let mut conn = loop {
+            if let Ok(acquisition) = self.db_pool.acquire().await {
+                break acquisition;
+            }
+        };
     }
 }
 

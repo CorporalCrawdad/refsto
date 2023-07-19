@@ -1,9 +1,10 @@
 use eframe::egui;
 use egui_extras::RetainedImage;
 use tokio::runtime;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use std::{sync::{{Arc, RwLock}, atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}}, path::PathBuf};
-use futures::{stream::futures_unordered::FuturesUnordered, StreamExt};
+use std::{sync::{{Arc, RwLock}, atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}}, path::PathBuf, time::Duration};
+use futures::stream::futures_unordered::FuturesUnordered;
 
 use crate::index::{HashIndexer, HashIndexError};
 
@@ -25,7 +26,7 @@ impl HashTracker {
 
 pub struct IndexingGui {
     filelist: Arc<RwLock<Option<Vec<PathBuf>>>>,
-    rt: Box<Arc<runtime::Runtime>>,
+    rt: Option<Arc<runtime::Runtime>>,
     hash_track: Arc<HashTracker>,
     cancel_token: CancellationToken,
     checkmark: RetainedImage,
@@ -38,10 +39,10 @@ pub struct IndexingGui {
 }
 
 impl IndexingGui {
-    pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>, rt: Box<Arc<runtime::Runtime>>, db_pool: sqlx::SqlitePool) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>, rt: Arc<runtime::Runtime>, db_pool: sqlx::SqlitePool) -> Self {
         let ig = IndexingGui {
             filelist: Arc::new(RwLock::new(None)),
-            rt,
+            rt: Some(rt),
             hash_track: Arc::new(HashTracker::new()),
             cancel_token: CancellationToken::new(),
             checkmark: RetainedImage::from_image_bytes("checkmark", CHECKMARK).unwrap(),
@@ -56,7 +57,8 @@ impl IndexingGui {
         let done_handle = ig.hash_track.clone();
         let cancel_handle = ig.cancel_token.clone();
         let path = path.into();
-        ig.rt.spawn(async move {
+        if !path.is_dir() { panic!("Invalid directory {}", path.display())};
+        ig.rt.as_ref().unwrap().spawn(async move {
             Self::load_filelist(path, fl_handle.clone()).await;
             Self::update_filelist(fl_handle.clone(), db_pool.clone(), done_handle.clone(), cancel_handle.clone()).await.unwrap();
             done_handle.done_hashing.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -101,13 +103,13 @@ impl IndexingGui {
         let hi = HashIndexer::new(db_pool);
         let mut tasknum = 0;
         // let mut fut_set = vec!();
-        let mut fut_set = futures::stream::FuturesUnordered::new();
+        let mut fut_set = FuturesUnordered::new();
         {
             if let Ok(lock) = filelist.read() {
                 if let Some(filelist) = &*lock {
                     for entry in filelist {
                         let entry = entry.to_str().unwrap();
-                        fut_set.push_back(hi.update(String::from(entry), tasknum));
+                        fut_set.push(hi.update(String::from(entry), tasknum));
                         tasknum += 1;
                     }
                 }
@@ -125,19 +127,19 @@ impl IndexingGui {
         tasknum = 0;
         // let _ = futures::future::join_all(fut_set).await;
         while let Some(result) = fut_set.next().await {
-            println!("Received future {}", tasknum);
-            tasknum += 1;
-            hash_track.hashed.fetch_add(1, Relaxed);
-            if cancel_token.is_cancelled() {
-                return Err(anyhow::anyhow!("hashing futures cancelled before completion"));
-            } else {
-                match result {
-                    Ok(_) => {},
-                    Err(HashIndexError::Format) => {hash_track.bad_format.fetch_add(1, Relaxed);},
-                    Err(HashIndexError::Encoding) => {hash_track.bad_encode.fetch_add(1, Relaxed);},
-                    Err(_) => (),
-                }
-            }
+                    println!("Received future {}", tasknum);
+                    tasknum += 1;
+                    hash_track.hashed.fetch_add(1, Relaxed);
+                    if cancel_token.is_cancelled() {
+                        return Err(anyhow::anyhow!("hashing futures cancelled before completion"));
+                    } else {
+                        match result {
+                            Ok(_) => {},
+                            Err(HashIndexError::Format) => {hash_track.bad_format.fetch_add(1, Relaxed);},
+                            Err(HashIndexError::Encoding) => {hash_track.bad_encode.fetch_add(1, Relaxed);},
+                            Err(_) => (),
+                        }
+                    }
         }
         println!("DB updates completed.");
         Ok(())
@@ -154,7 +156,7 @@ impl IndexingGui {
 
 impl eframe::App for IndexingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::Window::new("Updating image hash database...").show(ctx, |ui| {
             match self.filelist.try_read() {
                 Ok(mutguard) => {
                     if let Some(filelist) = &*mutguard {
@@ -194,7 +196,7 @@ impl eframe::App for IndexingGui {
                                     self.dupes_checked.store(false, Relaxed);
                                     self.hash_dupes = Arc::new(tokio::sync::RwLock::new(vec!()));
                                     self.bin_dupes = Arc::new(tokio::sync::RwLock::new(vec!()));
-                                    Self::spawn_find_dupes(self.rt.handle(), self.cancel_token.clone(), self.db_pool.clone(), self.hash_dupes.clone(), self.bin_dupes.clone(), self.hamming_proximity, self.dupes_checked.clone());
+                                    Self::spawn_find_dupes(self.rt.as_ref().unwrap().handle(), self.cancel_token.clone(), self.db_pool.clone(), self.hash_dupes.clone(), self.bin_dupes.clone(), self.hamming_proximity, self.dupes_checked.clone());
                                 }
                             }
                         } else {
@@ -226,5 +228,6 @@ impl eframe::App for IndexingGui {
 
     fn on_exit(&mut self, _ctx: Option<&eframe::glow::Context>) {
         self.cancel_token.cancel();
+        Arc::try_unwrap(self.rt.take().unwrap()).unwrap().shutdown_background();
     }
 }

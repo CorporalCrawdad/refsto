@@ -9,7 +9,7 @@ use crate::HASH_SIZE_BYTES;
 
 pub struct HashIndexer {
     db_pool: sqlx::SqlitePool,
-    // hasher: img_hash::Hasher,   
+    hasher_config: image_hasher::HasherConfig<[u8; crate::HASH_SIZE_BYTES]>,
 }
 
 pub enum HashIndexError {
@@ -22,7 +22,8 @@ pub enum HashIndexError {
 impl HashIndexer {
     pub fn new(db_pool: sqlx::SqlitePool) -> Self {
         // let hasher = img_hash::HasherConfig::new().to_hasher();
-        HashIndexer{db_pool}
+        let hasher_config = image_hasher::HasherConfig::with_bytes_type::<[u8; crate::HASH_SIZE_BYTES]>();
+        HashIndexer{db_pool, hasher_config}
     }
 
     pub async fn update(&self, filepath: String, tasknum: usize) -> Result<SqliteQueryResult, HashIndexError> {
@@ -39,7 +40,7 @@ impl HashIndexer {
         // check heuristic diff before updating hash
         // if lastmod or filesize different, rehash
         let mut conn = loop {
-            if let Ok(mut acquisition) = self.db_pool.acquire().await {
+            if let Ok(acquisition) = self.db_pool.acquire().await {
                 break acquisition;
             }
         };
@@ -60,10 +61,10 @@ impl HashIndexer {
             let img_bytes = image::io::Reader::open(filepath).unwrap().with_guessed_format().unwrap().decode();
             match img_bytes {
                 Ok(img_bytes) => {
-                    let phash = image_hasher::HasherConfig::with_bytes_type::<[u8; crate::HASH_SIZE_BYTES]>().to_hasher().hash_image(&img_bytes).to_base64();
-                    println!("Task {} hashing complete", tasknum);
+                    let phash = self.hasher_config.to_hasher().hash_image(&img_bytes).to_base64();
+                    // println!("Task {} hashing complete", tasknum);
                     let res = sqlx::query("INSERT OR REPLACE INTO entries (filepath, phash, filesize, lastmod) VALUES (?, ?, ?, ?)").bind(filepath).bind(phash).bind(filesize).bind(lastmod).execute(conn.acquire().await.unwrap()).await.or_else(|_| Err(HashIndexError::Other));
-                    println!("Task {} query completed", tasknum);
+                    // println!("Task {} query completed", tasknum);
                     res
                 },
                 Err(image::ImageError::Unsupported(_)) => return Err(HashIndexError::Format),
@@ -72,7 +73,7 @@ impl HashIndexer {
                 Err(_) => panic!(),
             }
         }.await;
-        println!("Task {} complete", tasknum);
+        // println!("Task {} complete", tasknum);
         res
     }
 
@@ -96,7 +97,7 @@ impl HashIndexer {
                 } else {
                     eprintln!("Error with query!");
                 }
-                println!("hash duped: {:?}", filepaths);
+                // println!("hash duped: {:?}", filepaths);
                 hash_dupes.push(filepaths);
             }
         }
@@ -127,7 +128,7 @@ impl HashIndexer {
             }
             for bin_set in result {
                 if bin_set.len() > 1 {
-                    println!("bin duped: {:?}", bin_set);
+                    // println!("bin duped: {:?}", bin_set);
                     bin_dupes.push(bin_set);
                 }
             }
@@ -136,14 +137,45 @@ impl HashIndexer {
 
     pub async fn cluster(&self, hash_dupes: Arc<RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<RwLock<Vec<Vec<String>>>>, hamming_range: usize, cancel_token: CancellationToken) {
         // Hamming range provided as 0 - 100 percentile difference.
-        // self.find_dupes(hash_dupes, bin_dupes, cancel_token).await;
-        let hamming_distance = (hamming_range * HASH_SIZE_BYTES) / 100;
+        // self.find_dupes(hash_dupes.clone(), bin_dupes, cancel_token).await;
+        let hamming_distance = (hamming_range * HASH_SIZE_BYTES * 8) / 100;
+        let hamming_distance: u32 = hamming_distance.try_into().unwrap();
+        println!("Checking for distance {}", hamming_distance);
 
         let mut conn = loop {
             if let Ok(acquisition) = self.db_pool.acquire().await {
                 break acquisition;
             }
         };
+        let mut hash_dupes = hash_dupes.write().await;
+        let mut hash_dupes_phashes: Vec<image_hasher::ImageHash::<[u8; HASH_SIZE_BYTES]>> = vec![];
+        for dupe_set in (*hash_dupes).iter() {
+            let set_phash = sqlx::query("SELECT phash FROM entries WHERE filepath = ?").bind(&dupe_set[0]).fetch_one(conn.acquire().await.unwrap()).await.unwrap();
+            hash_dupes_phashes.push(image_hasher::ImageHash::<[u8; HASH_SIZE_BYTES]>::from_base64(set_phash.get("phash")).unwrap());
+        }
+        assert_eq!(hash_dupes.len(), hash_dupes_phashes.len());
+
+        let mut all_entries = sqlx::query("SELECT * FROM entries;").fetch(conn.acquire().await.unwrap());
+        while let Some(Ok(row)) = all_entries.next().await {
+            let mut matched = false;
+            let phash = image_hasher::ImageHash::<[u8; HASH_SIZE_BYTES]>::from_base64(row.get("phash")).unwrap();
+            for (idx,reference) in hash_dupes_phashes.iter().enumerate() {
+                if phash.dist(&reference) <= hamming_distance {
+                    hash_dupes[idx].push(row.get::<String, &str>("filepath"));
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                hash_dupes.push(vec!(row.get::<String, &str>("filepath")));
+                hash_dupes_phashes.push(phash);
+                assert_eq!(hash_dupes.len(), hash_dupes_phashes.len());
+            }
+        }
+        hash_dupes.retain(|x| x.len()>1);
+        for set in hash_dupes.iter() {
+            println!("Dupe set: {:?}", set);
+        }
     }
 }
 

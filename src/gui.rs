@@ -9,7 +9,6 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use crate::index::{HashIndexer, HashIndexError};
 
 const CHECKMARK: &[u8] = include_bytes!("../assets/checkmark.png");
-const SET_IMAGE: &[u8] = include_bytes!("../assets/set_image.jpg");
 
 struct HashTracker {
     done_hashing: AtomicBool,
@@ -31,7 +30,7 @@ pub struct IndexingGui {
     hash_track: Arc<HashTracker>,
     cancel_token: CancellationToken,
     checkmark: RetainedImage,
-    set_image: RetainedImage,
+    set_images: Vec<RetainedImage>,
     db_pool: sqlx::SqlitePool,
     dupes_started: AtomicBool,
     dupes_checked: Arc<AtomicBool>,
@@ -42,13 +41,31 @@ pub struct IndexingGui {
 
 impl IndexingGui {
     pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>, rt: Arc<runtime::Runtime>, db_pool: sqlx::SqlitePool) -> Self {
+        let mut preloaded_imgs = vec![];
+        {
+            let mut rd = std::fs::read_dir("./test_data").unwrap().into_iter();
+            for i in 1..28 {
+                while let Some(entry) = rd.next() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_file() {
+                        let bytes = std::fs::read(entry.path());
+                        if bytes.is_ok() {
+                            if let Ok(success) = RetainedImage::from_image_bytes(format!("preload {i}"), &bytes.unwrap()) {
+                                preloaded_imgs.push(success);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let ig = IndexingGui {
             filelist: Arc::new(RwLock::new(None)),
             rt: Some(rt),
             hash_track: Arc::new(HashTracker::new()),
             cancel_token: CancellationToken::new(),
             checkmark: RetainedImage::from_image_bytes("checkmark", CHECKMARK).unwrap(),
-            set_image: RetainedImage::from_image_bytes("set_image", SET_IMAGE).unwrap(),
+            set_images: preloaded_imgs,
             db_pool: db_pool.clone(),
             hash_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
             bin_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
@@ -259,10 +276,6 @@ impl IndexingGui {
                 ui.horizontal_top(|ui| {
                     let avail_size = ui.available_size();
                     let set_view_height = 128.;
-                    let mut set_views: Vec<i32> = vec![];
-                    for i in 0..128 {
-                        set_views.push(i);
-                    }
                     // egui::ScrollArea::vertical().max_width(avail_size.x/3.).drag_to_scroll(false).show_rows(ui, set_view_height, set_views.len(), |ui, row_range| {
                     //     for set_view in &set_views[row_range] {
                     //         ui.horizontal(|ui| {
@@ -280,12 +293,12 @@ impl IndexingGui {
                         fill: Color32::GRAY,
                         stroke: egui::Stroke::new(2.0, Color32::BLACK),
                     }.show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_width(avail_size.x/3.).drag_to_scroll(false).show_rows(ui, set_view_height, set_views.len(), |ui, row_range| {
-                            for set_view in &set_views[row_range] {
+                        egui::ScrollArea::vertical().max_width(avail_size.x/3.).drag_to_scroll(false).show_rows(ui, set_view_height, self.set_images.len(), |ui, row_range| {
+                            for idx in row_range {
                                 ui.allocate_ui_at_rect(egui::Rect {min: ui.cursor().min, max: ui.cursor().min+[128.,128.].into()}, |ui| {
                                     ui.horizontal_centered(|ui| {
-                                        ui.label(format!("Row {}/{}", set_view, set_views.len()));
-                                        ui.image(self.set_image.texture_id(ui.ctx()), aspect_fit(self.set_image.size_vec2(), [128., 128.]));
+                                        ui.label(format!("Row {}/{}", idx, self.set_images.len()));
+                                        ui.image(self.set_images[idx].texture_id(ui.ctx()), aspect_fit(self.set_images[idx].size_vec2(), [128., 128.]));
                                     });
                                 });
                             }
@@ -306,7 +319,11 @@ impl IndexingGui {
                     }.show(ui, |ui| {
                         egui::ScrollArea::horizontal().max_height(140.).drag_to_scroll(false).show(ui, |ui| {
                             for i in 0..24 {
-                                ui.image(self.set_image.texture_id(ui.ctx()), aspect_fit(self.set_image.size_vec2(), [128.,128.]));
+                                ui.allocate_ui_at_rect(egui::Rect {min: ui.cursor().min, max: ui.cursor().min+[128.,128.].into()}, |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.image(self.set_images[i].texture_id(ui.ctx()), aspect_fit(self.set_images[i].size_vec2(), [128.,128.]));
+                                    });
+                                });
                             }
                         });
                         ui.allocate_space(ui.available_size());

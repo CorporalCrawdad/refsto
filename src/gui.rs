@@ -31,6 +31,7 @@ pub struct IndexingGui {
     cancel_token: CancellationToken,
     checkmark: RetainedImage,
     set_images: Vec<RetainedImage>,
+    set_images_mpsc: std::sync::mpsc::Receiver<RetainedImage>,
     db_pool: sqlx::SqlitePool,
     dupes_started: AtomicBool,
     dupes_checked: Arc<AtomicBool>,
@@ -41,31 +42,16 @@ pub struct IndexingGui {
 
 impl IndexingGui {
     pub fn new(_cc: &eframe::CreationContext<'_>, path: impl Into<PathBuf>, rt: Arc<runtime::Runtime>, db_pool: sqlx::SqlitePool) -> Self {
-        let mut preloaded_imgs = vec![];
-        {
-            let mut rd = std::fs::read_dir("./test_data").unwrap().into_iter();
-            for i in 1..28 {
-                while let Some(entry) = rd.next() {
-                    let entry = entry.unwrap();
-                    if entry.file_type().unwrap().is_file() {
-                        let bytes = std::fs::read(entry.path());
-                        if bytes.is_ok() {
-                            if let Ok(success) = RetainedImage::from_image_bytes(format!("preload {i}"), &bytes.unwrap()) {
-                                preloaded_imgs.push(success);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        println!("generating indexinggui");
+        let (set_images_tx, set_images_rx) = std::sync::mpsc::channel();
         let ig = IndexingGui {
             filelist: Arc::new(RwLock::new(None)),
             rt: Some(rt),
             hash_track: Arc::new(HashTracker::new()),
             cancel_token: CancellationToken::new(),
             checkmark: RetainedImage::from_image_bytes("checkmark", CHECKMARK).unwrap(),
-            set_images: preloaded_imgs,
+            set_images: vec![],
+            set_images_mpsc: set_images_rx,
             db_pool: db_pool.clone(),
             hash_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
             bin_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
@@ -73,9 +59,9 @@ impl IndexingGui {
             dupes_checked: Arc::new(AtomicBool::new(false)),
             hamming_proximity: 0,
         };
-        let fl_handle = ig.filelist.clone();
-        let done_handle = ig.hash_track.clone();
-        let cancel_handle = ig.cancel_token.clone();
+        // let fl_handle = ig.filelist.clone();
+        // let done_handle = ig.hash_track.clone();
+        // let cancel_handle = ig.cancel_token.clone();
         let path = path.into();
         if !path.is_dir() { eprintln!("Invalid directory \"{}\"", path.display()); exit(1)};
         // ig.rt.as_ref().unwrap().spawn(async move {
@@ -83,7 +69,40 @@ impl IndexingGui {
         //     Self::update_filelist(fl_handle.clone(), db_pool.clone(), done_handle.clone(), cancel_handle.clone()).await.unwrap();
         //     done_handle.done_hashing.store(true, std::sync::atomic::Ordering::Relaxed);
         // });
+        println!("spawning image loading tasks");
+        ig.rt.as_ref().unwrap().spawn(async move {
+            let mut count = 0;
+            let mut fut_set = FuturesUnordered::new();
+            let mut rd_iter = std::fs::read_dir("./test_data").unwrap();
+            while let Some(Ok(entry)) = rd_iter.next() {
+                count += 1;
+                // println!("spawning task {} for {}", count, entry.file_name().to_str().unwrap());
+                fut_set.push(async move {
+                    if let Ok(success) = RetainedImage::from_image_bytes(entry.file_name().to_string_lossy(), &std::fs::read(entry.path()).unwrap()) {
+                        return Some(success)
+                    } else {
+                        return None
+                    }
+                });
+            }
+            // println!("all tasks spawned");
+            while let Some(ri) = fut_set.next().await {
+                count -= 1;
+                // println!("task joined, {} left", count);
+                if let Some(ri) = ri {
+                    let _ = set_images_tx.send(ri);
+                }
+            }
+        });
+        println!("indexingui created, bye now");
         ig
+    }
+
+    fn get_set_images(&mut self) -> &Vec<RetainedImage> {
+        while let Ok(rx) = self.set_images_mpsc.try_recv() {
+            self.set_images.push(rx);
+        };
+        &self.set_images
     }
 
     async fn load_filelist(path: impl Into<PathBuf> + std::marker::Send, filelist: Arc<RwLock<Option<Vec<PathBuf>>>>) {
@@ -241,6 +260,7 @@ impl IndexingGui {
     }
 
     fn deduplication_win(&mut self, ui: &mut egui::Ui) {
+        println!("dedup window update time");
         ui.vertical(|ui| {
             egui::containers::Frame {
                 inner_margin: egui::style::Margin { left: 10., right: 10., top: 4., bottom: 4.},
@@ -275,15 +295,6 @@ impl IndexingGui {
             }.show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     let avail_size = ui.available_size();
-                    let set_view_height = 128.;
-                    // egui::ScrollArea::vertical().max_width(avail_size.x/3.).drag_to_scroll(false).show_rows(ui, set_view_height, set_views.len(), |ui, row_range| {
-                    //     for set_view in &set_views[row_range] {
-                    //         ui.horizontal(|ui| {
-                    //             ui.label(format!("Row {}/{}", set_view, set_views.len()));
-                    //             ui.image(self.set_image.texture_id(ui.ctx()), [128., 128.]);
-                    //         });
-                    //     }
-                    // });
                     ui.vertical(|ui| {
                     egui::containers::Frame {
                         inner_margin: egui::style::Margin { left: 10., right: 10., top: 4., bottom: 4.},
@@ -293,12 +304,20 @@ impl IndexingGui {
                         fill: Color32::GRAY,
                         stroke: egui::Stroke::new(2.0, Color32::BLACK),
                     }.show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_width(avail_size.x/3.).drag_to_scroll(false).show_rows(ui, set_view_height, self.set_images.len(), |ui, row_range| {
+                        println!("taking set_images len snapshot");
+                        let snapshot_set_images_len = self.get_set_images().len();
+                        egui::ScrollArea::vertical().max_width(avail_size.x/3.).drag_to_scroll(false).show_rows(ui, 128., snapshot_set_images_len, |ui, row_range| {
                             for idx in row_range {
                                 ui.allocate_ui_at_rect(egui::Rect {min: ui.cursor().min, max: ui.cursor().min+[128.,128.].into()}, |ui| {
                                     ui.horizontal_centered(|ui| {
-                                        ui.label(format!("Row {}/{}", idx, self.set_images.len()));
-                                        ui.image(self.set_images[idx].texture_id(ui.ctx()), aspect_fit(self.set_images[idx].size_vec2(), [128., 128.]));
+                                        ui.label(format!("Row {}/{}", idx, snapshot_set_images_len));
+                                        let cursor = egui::Rect::from_min_max(ui.cursor().min, ui.cursor().min+[128.,128.].into());
+                                        ui.allocate_ui_at_rect(egui::Rect {min: ui.cursor().min, max: ui.cursor().min+[128.,128.].into()}, |ui| {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.image(self.get_set_images()[idx].texture_id(ui.ctx()), aspect_fit(self.get_set_images()[idx].size_vec2(), [128., 128.]));
+                                            });
+                                        });
+                                        ui.painter_at(cursor).add(egui::Shape::rect_stroke(egui::Rect {min: cursor.min, max: cursor.min+[128.,128.].into()}, egui::Rounding::none(), egui::Stroke::new(5., egui::Color32::from_rgb(255, 100, 100))));
                                     });
                                 });
                             }
@@ -318,10 +337,10 @@ impl IndexingGui {
                         stroke: egui::Stroke::new(2.0, Color32::BLACK),
                     }.show(ui, |ui| {
                         egui::ScrollArea::horizontal().max_height(140.).drag_to_scroll(false).show(ui, |ui| {
-                            for i in 0..24 {
+                            for img in self.get_set_images().iter() {
                                 ui.allocate_ui_at_rect(egui::Rect {min: ui.cursor().min, max: ui.cursor().min+[128.,128.].into()}, |ui| {
                                     ui.centered_and_justified(|ui| {
-                                        ui.image(self.set_images[i].texture_id(ui.ctx()), aspect_fit(self.set_images[i].size_vec2(), [128.,128.]));
+                                        ui.image(img.texture_id(ui.ctx()), aspect_fit(img.size_vec2(), [128.,128.]));
                                     });
                                 });
                             }
@@ -351,7 +370,6 @@ fn aspect_fit(img_size: impl Into<egui::Vec2>, fit_size: impl Into<egui::Vec2>) 
 
 impl eframe::App for IndexingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
         egui::CentralPanel::default().show(ctx, |ui| {
             self.deduplication_win(ui);
         });

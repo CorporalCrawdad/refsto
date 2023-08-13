@@ -19,3 +19,4 @@ futures = "0.3.28"
 tokio-util = "0.7.8"
 native-dialog = "0.6.4"
 dirs = "5.0.1"
+xxhash-rust = {version="0.8.6", features=["xxh3"]}

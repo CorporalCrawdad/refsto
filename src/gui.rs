@@ -1,16 +1,46 @@
 // use eframe::{egui::{self, RichText}, epaint::Color32};
-use eframe::{egui, egui::{RichText, Color32, Vec2, Rect}};
+use eframe::{egui, egui::{RichText, Color32, Vec2, Rect, Ui}};
 use egui_extras::RetainedImage;
 use tokio::runtime;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use std::{sync::{{Arc, RwLock}, atomic::{AtomicBool, Ordering::Relaxed}, mpsc, mpsc::TryRecvError}, path::PathBuf, collections::HashSet};
+use std::{sync::{{Arc, RwLock}, atomic::{Ordering::Relaxed, AtomicI64}, mpsc, mpsc::TryRecvError}, path::PathBuf, collections::HashSet};
 use futures::stream::futures_unordered::FuturesUnordered;
 use sqlx::{Row,Acquire};
 
 use crate::index::{HashIndexer, HashIndexError};
 
 const CHECKMARK: &[u8] = include_bytes!("../assets/checkmark.png");
+
+#[derive(PartialEq)]
+enum PopOvers {
+    LibraryManager,
+    HashingDbUpdate,
+    BinaryDedup(BinDedupStep),
+    None
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum KeepWhichFile {
+    CreatedFirst, // ctime
+    ModifiedFirst, // mtime
+    PathShortest, // char count of full path
+    NameShortest, // char count of filename
+    PathShallowest, // least directories deep
+}
+
+#[derive(PartialEq)]
+enum BinDedupStep {
+    SelectMethod,
+    Loading,
+    ReviewFilelist,
+    _Deletion,
+}
+
+pub enum BinDupeMessage {
+    NewSet,
+    Entry(PathBuf),
+}
 
 pub struct IndexingGui {
     watched_dirs: Arc<RwLock<HashSet<PathBuf>>>,
@@ -23,18 +53,20 @@ pub struct IndexingGui {
     set_images_recv: mpsc::Receiver<RetainedImage>,
     filelist_recv: Option<mpsc::Receiver<PathBuf>>,
     db_pool: sqlx::SqlitePool,
-    _dupes_started: AtomicBool,
-    _dupes_checked: Arc<AtomicBool>,
-    _hash_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>,
-    _bin_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>,
     hamming_proximity: usize,
-    show_library_man: bool,
-    show_dialog_err: bool,
-    show_hashing: bool,
     filelist: HashSet<PathBuf>,
     filelist_loaded: bool,
     rehashed_cnt: usize,
     rehashed_cnt_recv: Option<mpsc::Receiver<usize>>,
+    popover: PopOvers,
+    error_no_dialogs: bool,
+    watched_image_count: Arc<AtomicI64>,
+    bin_dedup_method: KeepWhichFile,
+    bin_dedup_method_reversed: bool,
+    bin_dupes: Vec<HashSet<PathBuf>>,
+    bin_dupes_recv: Option<mpsc::Receiver<BinDupeMessage>>,
+    incl_ignored: bool,
+    // bin_dedup_step: BinDedupStep,
 }
 
 impl IndexingGui {
@@ -42,6 +74,7 @@ impl IndexingGui {
         let (set_images_tx, set_images_rx) = std::sync::mpsc::channel();
         let mut ig = IndexingGui {
             watched_dirs: Arc::new(RwLock::new(HashSet::new())),
+            watched_image_count: Arc::new(AtomicI64::new(0)),
             rt: Some(rt),
             cancel_token: CancellationToken::new(),
             hashing_cancelled: CancellationToken::new(),
@@ -49,23 +82,28 @@ impl IndexingGui {
             set_images: vec![],
             set_images_recv: set_images_rx,
             db_pool: db_pool.clone(),
-            _hash_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
-            _bin_dupes: Arc::new(tokio::sync::RwLock::new(vec!())),
-            _dupes_started: AtomicBool::new(false),
-            _dupes_checked: Arc::new(AtomicBool::new(false)),
             hamming_proximity: 0,
-            show_library_man: false,
-            show_dialog_err: false,
             filelist: HashSet::new(),
             filelist_recv: None,
             filelist_loaded: false,
-            show_hashing: false,
             hashing_complete: true,
             rehashed_cnt: 0,
             rehashed_cnt_recv: None,
+            popover: PopOvers::None,
+            error_no_dialogs: false,
+            bin_dedup_method: KeepWhichFile::CreatedFirst,
+            bin_dedup_method_reversed: false,
+            bin_dupes: vec![],
+            bin_dupes_recv: None,
+            incl_ignored: false,
+            // bin_dedup_step: BinDedupStep::SelectMethod,
         };
 
+        // dummy code that loads images from disk into ui
+        let wic = ig.watched_image_count.clone();
+        let conn = ig.db_pool.clone();
         ig.rt.as_ref().unwrap().spawn(async move {
+            wic.store(sqlx::query("SELECT COUNT(*) FROM entries WHERE ignored = 0;").fetch_one(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().get::<i64,_>(0), Relaxed);
             let mut fut_set = FuturesUnordered::new();
             let mut rd_iter = std::fs::read_dir("./test_data").unwrap();
             while let Some(Ok(entry)) = rd_iter.next() {
@@ -166,6 +204,46 @@ impl IndexingGui {
         &self.set_images
     }
 
+    fn spawn_load_filelist(&mut self) {
+        if let Ok(lock) = self.watched_dirs.read() {
+            let (tx,rx) = std::sync::mpsc::channel::<PathBuf>();
+            self.filelist_recv = Some(rx);
+            let mut fut_set = FuturesUnordered::new();
+            for dir in lock.iter() {
+                if !dir.is_dir() {
+                    eprintln!("{} is not a directory!!", dir.to_string_lossy());
+                    continue
+                }
+                let tx = tx.clone();
+                let dir = dir.to_owned();
+                fut_set.push(async move {
+                    let mut dirlist = vec![dir];
+                    while let Some(dir) = dirlist.pop() {
+                        if let Ok(entries) = dir.read_dir() {
+                            let entries: Vec<std::fs::DirEntry> = entries.into_iter().flatten().collect();
+                            for entry in entries {
+                                let ft = entry.file_type().unwrap();
+                                if ft.is_file() {
+                                    if tx.send(entry.path()).is_err() {
+                                        eprintln!("Error: mpsc closed before receiving {}", entry.path().to_string_lossy());
+                                    }
+                                } else if ft.is_dir() {
+                                    dirlist.push(entry.path());
+                                } else {
+                                    eprintln!("Can't interpret filetype of: {}", entry.path().to_string_lossy());
+                                }
+                            }
+                        }
+                    }
+                })
+            }
+            let ct = self.hashing_cancelled.clone();
+            self.rt.as_ref().unwrap().spawn(async move {
+                while let Some(_) = fut_set.next().await{ if ct.is_cancelled() { break } }
+            });
+        }
+    }
+
     // async fn load_filelist(paths: Arc<RwLock<HashSet<PathBuf>>>) -> Vec<PathBuf> {
     //     let paths = paths.read().unwrap();
     //     let mut filelist = vec![];
@@ -243,13 +321,13 @@ impl IndexingGui {
     //     Ok(())
     // }
 
-    fn spawn_find_dupes(rt_handle: &runtime::Handle, cancel_token: CancellationToken, db_pool: sqlx::SqlitePool, hash_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, hamming_proximity: usize, done_flag: Arc<AtomicBool>) {
-        rt_handle.spawn(async move {
-            let hi = HashIndexer::new(db_pool);
-            hi.cluster(hash_dupes, bin_dupes, hamming_proximity, cancel_token).await;
-            done_flag.store(true, Relaxed);
-        });
-    }
+    // fn spawn_find_dupes(rt_handle: &runtime::Handle, cancel_token: CancellationToken, db_pool: sqlx::SqlitePool, hash_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, hamming_proximity: usize, done_flag: Arc<AtomicBool>) {
+    //     rt_handle.spawn(async move {
+    //         let hi = HashIndexer::new(db_pool);
+    //         hi.cluster(hash_dupes, bin_dupes, hamming_proximity, cancel_token).await;
+    //         done_flag.store(true, Relaxed);
+    //     });
+    // }
 
     fn deduplication_win(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
@@ -262,7 +340,7 @@ impl IndexingGui {
                 stroke: egui::Stroke::default(),
             }.show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let _ = ui.button("Deduplicate Exact Matches");
+                    if ui.button("Deduplicate Exact Matches").clicked() { self.popover = PopOvers::BinaryDedup(BinDedupStep::SelectMethod) }
                     ui.separator();
                     ui.add(egui::widgets::DragValue::new(&mut self.hamming_proximity).clamp_range(0..=100));
                     ui.label(RichText::new("% different by hash").color(Color32::BLACK));
@@ -270,16 +348,27 @@ impl IndexingGui {
                     }
                     // change to RTL
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Library settings").clicked() {
-                            self.show_library_man = true;
+                        if ui.button("Library settings")
+                            .on_hover_text_at_pointer(RichText::new("After managing watched directories, click\nRELOAD to refetch list of files and \nupdate/re-hash them into the database.").color(egui::Color32::WHITE))
+                            .clicked() {
+                            self.popover = PopOvers::LibraryManager;
                             self.filelist_loaded = false;
                         }
                         ui.separator();
-                        ui.label(RichText::new("0 managed images").color(Color32::BLACK));
+                        ui.label(RichText::new(format!("{} managed images", self.watched_image_count.load(Relaxed))).color(Color32::BLACK));
                         if ui.button("RELOAD").clicked() {
-                            self.show_hashing = true;
+                            self.popover = PopOvers::HashingDbUpdate;
                             self.filelist_loaded = false;
                             self.hashing_cancelled = CancellationToken::new();
+                        }
+                        if ui.button("CLEAN MISSING").clicked() {
+                            let conn = self.db_pool.clone();
+                            let cloned_list = self.filelist.clone();
+                            self.rt.as_ref().unwrap().spawn(async move {
+                                let stored_filelist: HashSet<PathBuf> = sqlx::query("SELECT * FROM entries").fetch_all(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().iter().map(|x| PathBuf::from(x.get::<String,_>("filepath"))).collect();
+                                let deleted_files: Vec<String> = stored_filelist.difference(&cloned_list).map(|x| x.to_string_lossy().to_string()).collect();
+                                println!("Files missing from filesystem:\n{:?}", deleted_files);
+                            });
                         }
                     });
                 });
@@ -353,80 +442,79 @@ impl IndexingGui {
     fn watch_dir_manager_win(&mut self, ctx: &egui::Context) {
         let mut dir_to_del: Option<PathBuf> = None;
         let mut dir_to_add = None;
-        if self.show_library_man { egui::Area::new("dirwatchwin").movable(false).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.,0.]).show(ctx, |ui| {
-        // egui::Window::new("dirwatchwin").movable(false).anchor(egui::Align2::CENTER_CENTER, [0.,0.]).collapsible(false).resizable(false).open(&mut self.show_library_man).show(ctx, |ui| {
-            egui::containers::Frame::popup(&egui::Style::default())
-                .inner_margin(egui::style::Margin { left: 10., right: 10., top: 4., bottom: 4.})
-                .fill(Color32::GRAY)
-                // .outer_margin(egui::style::Margin::default()) .rounding(egui::Rounding::default()) .stroke(egui::Stroke::default())
-            .show(ui, |ui| {
-                ui.set_max_size([400.,600.,].into());
-                // ui.horizontal(|ui| {
-                //     egui::containers::TopBottomPanel::top("dir manager win panel").show_inside(ui, |ui| {
-                //         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                //             self.show_library_man = !ui.add(egui::Button::new(RichText::new("🗙").color(Color32::WHITE).strong().size(20.)).fill(Color32::LIGHT_RED)).clicked();
-                //         });
-                //     });
-                // });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Drag and drop directories to add or").color(egui::Color32::BLACK));
-                    ui.add_space(18.);
-                    if ui.button(RichText::new("Add a Directory").color(egui::Color32::from_rgb(0, 255, 255))).clicked() {
-                        if let Ok(dlg_result) = native_dialog::FileDialog::new()
-                            .set_location("~")
-                            .show_open_single_dir() {
-                                dir_to_add = dlg_result;
-                            } else {
-                                self.show_dialog_err = true;
-                            }
-                    };
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                            self.show_library_man = !ui.add(egui::Button::new(RichText::new("🗙").color(Color32::WHITE).strong().size(20.)).fill(Color32::LIGHT_RED)).clicked();
-                    });
+        popover_frame("dirwatchwin", ctx, Some([400.,600.].into()), |ui| {
+            // ui.horizontal(|ui| {
+            //     egui::containers::TopBottomPanel::top("dir manager win panel").show_inside(ui, |ui| {
+            //         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            //             self.show_library_man = !ui.add(egui::Button::new(RichText::new("🗙").color(Color32::WHITE).strong().size(20.)).fill(Color32::LIGHT_RED)).clicked();
+            //         });
+            //     });
+            // });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Drag and drop directories to add or").color(egui::Color32::BLACK));
+                ui.add_space(18.);
+                if ui.button(RichText::new("Add a Directory").color(egui::Color32::from_rgb(0, 255, 255))).clicked() {
+                    if let Ok(dlg_result) = native_dialog::FileDialog::new()
+                        .set_location("~")
+                        .show_open_single_dir() {
+                            dir_to_add = dlg_result;
+                        } else {
+                            self.error_no_dialogs = true;
+                        }
+                };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        if ui.add(egui::Button::new(RichText::new("🗙").color(Color32::WHITE).strong().size(20.)).fill(Color32::LIGHT_RED)).clicked() {
+                            self.popover = PopOvers::None;
+                        }
                 });
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    match self.watched_dirs.try_read() {
-                        Ok(watched_dirs) => {
-                            for dir in (*watched_dirs).iter() {
-                                egui::containers::Frame {
-                                    inner_margin: egui::style::Margin { left: 2., right: 2., top: 4., bottom: 4.},
-                                    outer_margin: egui::style::Margin { left: 2., right: 2., top: 4., bottom: 4.},
-                                    rounding: egui::Rounding::default(),
-                                    shadow: eframe::epaint::Shadow::default(),
-                                    fill: Color32::from_rgb(224, 252, 250),
-                                    stroke: egui::Stroke::default(),
-                                }.show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let entrycolor; 
-                                        if dir.is_dir() {
-                                            entrycolor = Color32::BLACK;
-                                        } else {
-                                            entrycolor = Color32::DARK_RED;
-                                            ui.label(RichText::new("!!!").color(entrycolor));
+            });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                match self.watched_dirs.try_read() {
+                    Ok(watched_dirs) => {
+                        for dir in (*watched_dirs).iter() {
+                            egui::containers::Frame {
+                                inner_margin: egui::style::Margin { left: 2., right: 2., top: 4., bottom: 4.},
+                                outer_margin: egui::style::Margin { left: 2., right: 2., top: 4., bottom: 4.},
+                                rounding: egui::Rounding::default(),
+                                shadow: eframe::epaint::Shadow::default(),
+                                fill: Color32::from_rgb(224, 252, 250),
+                                stroke: egui::Stroke::default(),
+                            }.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let entrycolor; 
+                                    if dir.is_dir() {
+                                        entrycolor = Color32::BLACK;
+                                    } else {
+                                        entrycolor = Color32::DARK_RED;
+                                        ui.label(RichText::new("!!!").color(entrycolor));
+                                    };
+                                    ui.label(RichText::new(dir.to_string_lossy()).color(entrycolor));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                        if ui.add(egui::Button::new(RichText::new("REMOVE").strong().color(Color32::WHITE)).fill(egui::Color32::RED)).clicked() {
+                                            dir_to_del = Some(dir.to_owned());
                                         };
-                                        ui.label(RichText::new(dir.to_string_lossy()).color(entrycolor));
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                                            if ui.add(egui::Button::new(RichText::new("REMOVE").strong().color(Color32::WHITE)).fill(egui::Color32::RED)).clicked() {
-                                                dir_to_del = Some(dir.to_owned());
-                                            };
-                                        });
                                     });
                                 });
-                            }
-                        },
-                        Err(_) => {
-                            ui.horizontal(|ui| {
-                                ui.label("Loading managed directories from database...");
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                                    ui.spinner();
-                                });
                             });
-                        },
-                    }
-                });
-            ui.allocate_space(ui.available_size());
+                        }
+                    },
+                    Err(_) => {
+                        ui.horizontal(|ui| {
+                            ui.label("Loading managed directories from database...");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                ui.spinner();
+                            });
+                        });
+                    },
+                }
             });
-        });}
+        });
+        if self.error_no_dialogs {
+            popover_frame("Dialog Error", ctx, Some([200.,200.].into()), |ui| {
+                ui.colored_label(egui::Color32::RED, "ERROR: no system dialog found");
+                self.error_no_dialogs = !ui.button("OK").clicked();
+            });
+        }
         if let Some(dir) = dir_to_del {
             self.del_watched_dir(dir, false);
         }
@@ -448,220 +536,276 @@ impl IndexingGui {
         }
     }
 
-    // fn hashing_popup(&mut self, ctx: &egui::Context) {
-    //     egui::Window::new("Updating image hash database...").show(ctx, |ui| { 
-    //         match self.filelist.try_read() {
-    //             Ok(mutguard) => {
-    //                 if let Some(filelist) = &*mutguard {
-    //                     ui.horizontal(|ui| {
-    //                         ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
-    //                         ui.label(format!("File list loaded! Found {} files...", filelist.len()));
-    //                     });
-    //                     if self.hash_track.done_hashing.load(Relaxed) {
-    //                         ui.horizontal(|ui| {
-    //                             ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
-    //                             ui.label(format!("Hashing complete for {} files", self.hash_track.hashed.load(Relaxed)));
-    //                         });
-    //                         if self.dupes_checked.load(Relaxed) {
-    //                             match (self.hash_dupes.try_read(), self.bin_dupes.try_read()) {
-    //                                 (Ok(hash_dupes), Ok(bin_dupes)) => {
-    //                                     ui.horizontal(|ui| {
-    //                                         self.dupes_started.store(false, Relaxed);
-    //                                         ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
-    //                                         ui.label(format!("Found {} sets of images with at least one duplication.", hash_dupes.len()+bin_dupes.len()));
-    //                                     });
-    //                                     for set in hash_dupes.iter().chain(bin_dupes.iter()) {
-    //                                         ui.label(format!("DUPLICATE SET: (len {})\t{:?}", set.len(), set.join(", ")));
-    //                                     }
-    //                                 },
-    //                                 (_,_) => {
-    //                                     ui.horizontal(|ui| {
-    //                                         ui.add(egui::Spinner::new());
-    //                                         ui.add(egui::Label::new("Comparing for binary duplicates and visually identical images..."));
-    //                                     });
-    //                                 },
-    //                             }
-    //                         }
-    //                         if !self.dupes_started.load(Relaxed) {
-    //                             ui.add(egui::Slider::new(&mut self.hamming_proximity, 0..=100).text("% Difference"));
-    //                             if ui.button(format!("Search database for images with {}% difference.", self.hamming_proximity)).clicked() {
-    //                                 self.dupes_started.store(true, Relaxed);
-    //                                 self.dupes_checked.store(false, Relaxed);
-    //                                 self.hash_dupes = Arc::new(tokio::sync::RwLock::new(vec!()));
-    //                                 self.bin_dupes = Arc::new(tokio::sync::RwLock::new(vec!()));
-    //                                 assert_eq!(self.hash_dupes.blocking_read().len(), 0);
-    //                                 Self::spawn_find_dupes(self.rt.as_ref().unwrap().handle(), self.cancel_token.clone(), self.db_pool.clone(), self.hash_dupes.clone(), self.bin_dupes.clone(), self.hamming_proximity, self.dupes_checked.clone());
-    //                             }
-    //                         }
-    //                     } else {
-    //                         ui.horizontal(|ui| {
-    //                             ui.spinner();
-    //                             ui.label(format!("Hashing files... {}/{}", self.hash_track.hashed.load(Relaxed), self.hash_track.to_hash.load(Relaxed)));
-    //                             if self.hash_track.bad_encode.load(Relaxed) > 0 {
-    //                                 ui.label(format!("BAD ENCODED FILES ENCOUNTERED! Malformed pictures cannot be hashed, try fixing with imagemagick and re-run."));
-    //                             }
-    //                         });
-    //                     }
-    //                 } else {
-    //                     ui.horizontal(|ui| {
-    //                         ui.add(egui::Spinner::new());
-    //                         ui.add(egui::Label::new("Loading filelist..."));
-    //                     });
-    //                 }
-    //             },
-    //             Err(std::sync::TryLockError::WouldBlock) => {
-    //                 ui.horizontal(|ui| {
-    //                     ui.add(egui::Spinner::new());
-    //                     ui.add(egui::Label::new("Loading filelist..."));
-    //                 });
-    //             },
-    //             Err(_) => panic!(),
-    //         }
-    //     });
-    // }
-
     fn hashing_progress_win(&mut self, ctx: &egui::Context) {
-        if self.show_hashing {
-            egui::Area::new("Hashing Images...").movable(false).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.,0.]).show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::GRAY)
-                    .stroke(egui::Stroke::new(3., egui::Color32::BLACK))
-                    .rounding(egui::Rounding::same(4.))
-                    .inner_margin(egui::Margin::symmetric(3., 3.))
-                    .show(ui, |ui| {
-                        if !self.filelist_loaded { match &self.filelist_recv {
-                            Some(filelist_recv) => {
-                                loop {
-                                    match filelist_recv.try_recv() {
-                                        Ok(filename) => {self.filelist.insert(filename);},
-                                        Err(TryRecvError::Empty) => break,
-                                        Err(TryRecvError::Disconnected) => {
-                                            self.filelist_loaded = true;
-                                            self.hashing_complete = false;
-                                            let mut fut_set = FuturesUnordered::new();
-                                            self.rehashed_cnt = 0;
-                                            let (tx, rx) = mpsc::channel();
-                                            self.rehashed_cnt_recv = Some(rx);
-                                            for entry in &self.filelist {
-                                                println!("looking at {}", entry.to_string_lossy());
-                                                let db_pool = self.db_pool.clone();
-                                                let entry = entry.to_owned();
-                                                let tx = tx.clone();
-                                                fut_set.push(async move {
-                                                    match HashIndexer::new(db_pool).update(entry.to_string_lossy().into()).await {
-                                                        Ok(_) => (),
-                                                        Err(HashIndexError::Encoding) => eprintln!("Encoding Error on file '{}'", entry.to_string_lossy()),
-                                                        // Enable for verbose skipping of non-image files
-                                                        // Err(HashIndexError::Format) => eprintln!("Skipping bad format file '{}'", entry.to_string_lossy()),
-                                                        Err(HashIndexError::Format) => (),
-                                                        Err(HashIndexError::MalformedDB) => eprintln!("MalformedDB Error on file '{}'", entry.to_string_lossy()),
-                                                        Err(HashIndexError::InsertDB) => eprintln!("InsertDB Error on file '{}'", entry.to_string_lossy()),
-                                                        Err(HashIndexError::Other) => eprintln!("Other Error on file '{}'", entry.to_string_lossy()),
-                                                    }
-                                                    tx.send(1).unwrap();
-                                                })
-                                            }
-                                            let ct = self.hashing_cancelled.clone();
-                                            println!("started {} update tasks", fut_set.len());
-                                            self.rt.as_ref().unwrap().spawn(async move {
-                                                while let Some(_) = fut_set.next().await { if ct.is_cancelled() { break };}
-                                            });
-                                            break
+        popover_frame("Hashing Progress Window", ctx, None, |ui| {
+            if !self.filelist_loaded { match &self.filelist_recv {
+                Some(filelist_recv) => {
+                    loop {
+                        match filelist_recv.try_recv() {
+                            Ok(filename) => {self.filelist.insert(filename);},
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                self.filelist_loaded = true;
+                                self.hashing_complete = false;
+                                let mut fut_set = FuturesUnordered::new();
+                                self.rehashed_cnt = 0;
+                                let (tx, rx) = mpsc::channel();
+                                self.rehashed_cnt_recv = Some(rx);
+                                for entry in &self.filelist {
+                                    println!("looking at {}", entry.to_string_lossy());
+                                    let db_pool = self.db_pool.clone();
+                                    let entry = entry.to_owned();
+                                    let tx = tx.clone();
+                                    fut_set.push(async move {
+                                        match HashIndexer::new(db_pool).update(entry.to_string_lossy().into()).await {
+                                            Ok(_) => (),
+                                            Err(HashIndexError::Encoding) => eprintln!("Encoding Error on file '{}'", entry.to_string_lossy()),
+                                            // Enable for verbose skipping of non-image files
+                                            // Err(HashIndexError::Format) => eprintln!("Skipping bad format file '{}'", entry.to_string_lossy()),
+                                            Err(HashIndexError::Format) => (),
+                                            Err(HashIndexError::MalformedDB) => eprintln!("MalformedDB Error on file '{}'", entry.to_string_lossy()),
+                                            Err(HashIndexError::InsertDB) => eprintln!("InsertDB Error on file '{}'", entry.to_string_lossy()),
+                                            Err(HashIndexError::Other) => eprintln!("Other Error on file '{}'", entry.to_string_lossy()),
                                         }
-                                    }
+                                        tx.send(1).unwrap();
+                                    })
                                 }
-                                while let Ok(filename) = filelist_recv.try_recv() {
-                                    self.filelist.insert(filename);
-                                }
-                            },
-                            None => {
-                                if let Ok(lock) = self.watched_dirs.read() {
-                                    let (tx,rx) = std::sync::mpsc::channel::<PathBuf>();
-                                    self.filelist_recv = Some(rx);
-                                    let mut fut_set = FuturesUnordered::new();
-                                    for dir in lock.iter() {
-                                        if !dir.is_dir() {
-                                            eprintln!("{} is not a directory!!", dir.to_string_lossy());
-                                            continue
-                                        }
-                                        let tx = tx.clone();
-                                        let dir = dir.to_owned();
-                                        println!("Adding future for dir {}", dir.to_string_lossy());
-                                        fut_set.push(async move {
-                                            let mut dirlist = vec![dir];
-                                            while let Some(dir) = dirlist.pop() {
-                                                if let Ok(entries) = dir.read_dir() {
-                                                    for entry in entries {
-                                                        if let Ok(entry) = entry {
-                                                            let ft = entry.file_type().unwrap();
-                                                            if ft.is_file() {
-                                                                if tx.send(entry.path()).is_err() {
-                                                                    eprintln!("Error: mpsc closed before receiving {}", entry.path().to_string_lossy());
-                                                                }
-                                                            } else if ft.is_dir() {
-                                                                dirlist.push(entry.path());
-                                                            } else {
-                                                                eprintln!("Can't interpret filetype of: {}", entry.path().to_string_lossy());
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        })
-                                    }
-                                    let ct = self.hashing_cancelled.clone();
-                                    self.rt.as_ref().unwrap().spawn(async move {
-                                        while let Some(_) = fut_set.next().await{ if ct.is_cancelled() { break } }
-                                    });
-                                }
+                                let ct = self.hashing_cancelled.clone();
+                                println!("started {} update tasks", fut_set.len());
+
+                                // let conn = self.db_pool.clone();
+                                // let cloned_list = self.filelist.clone();
+                                // self.rt.as_ref().unwrap().spawn(async move {
+                                //     let stored_filelist: HashSet<PathBuf> = sqlx::query("SELECT * FROM entries").fetch_all(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().iter().map(|x| PathBuf::from(x.get::<String,_>("filepath"))).collect();
+                                //     let deleted_files: Vec<String> = stored_filelist.difference(&cloned_list).map(|x| x.to_string_lossy().to_string()).collect();
+                                //     println!("Files missing from filesystem:\n{:?}", deleted_files);
+                                // });
+
+                                let wic = self.watched_image_count.clone();
+                                let conn = self.db_pool.clone();
+                                self.rt.as_ref().unwrap().spawn(async move {
+                                    while let Some(_) = fut_set.next().await { if ct.is_cancelled() { break };}
+                                    wic.store(sqlx::query("SELECT COUNT(*) FROM entries WHERE ignored = 0;").fetch_one(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().get::<i64,_>(0), Relaxed);
+                                });
+                                break
                             }
-                        } } else {
-                            self.filelist_recv = None;
-                            if let Some(recv) = &self.rehashed_cnt_recv {
-                                match recv.try_recv() {
-                                    Ok(rx) => self.rehashed_cnt += rx,
-                                    Err(TryRecvError::Empty) => (),
-                                    Err(TryRecvError::Disconnected) => {self.hashing_complete = true},
-                                };
-                            }
-                        } 
-                        ui.horizontal(|ui| {
-                            if self.filelist_loaded {
-                                ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
-                            } else {
-                                ui.add(egui::Spinner::new().size(24.));
-                            }
-                            ui.label(egui::RichText::new(format!("Discovered {} files...", self.filelist.len())).color(egui::Color32::BLACK));
-                        });
-                        // let widest = ui.horizontal(|ui| {
-                        ui.horizontal(|ui| {
-                            match (self.hashing_complete, self.filelist_loaded) {
-                                (true,true) => {ui.image(self.checkmark.texture_id(ctx), [12.,12.]); self.rehashed_cnt_recv = None},
-                                (false,true) => {ui.add(egui::Spinner::new().size(12.));},
-                                (_, false) => ui.add_space(12.),
-                            }
-                            ui.label(egui::RichText::new(format!("Updated {}/{} files...", self.rehashed_cnt, self.filelist.len())).color(egui::Color32::BLACK));
-                        }).response.rect.width();
-                        if self.hashing_complete && self.filelist_loaded {
-                            ui.horizontal(|ui| { ui.label(egui::RichText::new("Hashing complete, database updated!").color(egui::Color32::LIGHT_GREEN));});
                         }
-                        // ui.allocate_ui_with_layout([widest, 0.].into(), egui::Layout::top_down(egui::Align::Center), |ui| {
-                        ui.allocate_ui_with_layout([ui.min_size()[0], 0.].into(), egui::Layout::top_down(egui::Align::Center), |ui| {
-                            if self.hashing_complete && self.filelist_loaded {
-                                if ui.button("CLOSE").clicked() {
-                                    self.show_hashing = false;
+                    }
+                    while let Ok(filename) = filelist_recv.try_recv() {
+                        self.filelist.insert(filename);
+                    }
+                },
+                None => self.spawn_load_filelist()
+                }
+            } else {
+                self.filelist_recv = None;
+                if let Some(recv) = &self.rehashed_cnt_recv {
+                    match recv.try_recv() {
+                        Ok(rx) => self.rehashed_cnt += rx,
+                        Err(TryRecvError::Empty) => (),
+                        Err(TryRecvError::Disconnected) => {self.hashing_complete = true},
+                    };
+                }
+            } 
+            ui.horizontal(|ui| {
+                if self.filelist_loaded {
+                    ui.image(self.checkmark.texture_id(ctx), [12.,12.]);
+                } else {
+                    ui.add(egui::Spinner::new().size(24.));
+                }
+                ui.label(egui::RichText::new(format!("Discovered {} files...", self.filelist.len())).color(egui::Color32::BLACK));
+            });
+            // let widest = ui.horizontal(|ui| {
+            ui.horizontal(|ui| {
+                match (self.hashing_complete, self.filelist_loaded) {
+                    (true,true) => {ui.image(self.checkmark.texture_id(ctx), [12.,12.]); self.rehashed_cnt_recv = None},
+                    (false,true) => {ui.add(egui::Spinner::new().size(12.));},
+                    (_, false) => ui.add_space(12.),
+                }
+                ui.label(egui::RichText::new(format!("Updated {}/{} files...", self.rehashed_cnt, self.filelist.len())).color(egui::Color32::BLACK));
+            }).response.rect.width();
+            if self.hashing_complete && self.filelist_loaded {
+                ui.horizontal(|ui| { ui.label(egui::RichText::new("Hashing complete, database updated!").color(egui::Color32::LIGHT_GREEN));});
+            }
+            hcenter_no_expand(ui, |ui| {
+                let text = if self.hashing_complete && self.filelist_loaded {
+                        "CLOSE"
+                    } else {
+                        "CANCEL"
+                    };
+                if ui.button(text).clicked() {
+                    self.popover = PopOvers::None;
+                    self.hashing_cancelled.cancel();
+                }
+            });
+        });
+    }
+
+    fn binary_dedup_win(&mut self, ctx: &egui::Context) {
+        match self.popover {
+            PopOvers::BinaryDedup(BinDedupStep::SelectMethod) => {
+                popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
+                    ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
+                    hcenter_no_expand(ui, |ui| {ui.separator();});
+                    ui.colored_label(Color32::BLACK, "Which duplicate should be kept:");
+                    let width = ui.min_size().x;
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(200, 190, 164))
+                        .inner_margin(egui::Margin::symmetric(5., 5.))
+                        .outer_margin(egui::Margin::symmetric(5., 5.))
+                        .show(ui, |ui| {
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::CreatedFirst,   RichText::new("Created first").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::ModifiedFirst,  RichText::new("Modified least recently").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::NameShortest,   RichText::new("Shortest name").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::PathShallowest, RichText::new("Shallowest path").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::PathShortest,   RichText::new("Shortest path").color(Color32::BLACK));
+                            ui.allocate_space([width-20., 0.].into());
+                            hcenter_no_expand(ui, |ui| {
+                                ui.separator();
+                                ui.checkbox(&mut self.bin_dedup_method_reversed, "Reverse order").on_hover_text_at_pointer("Switches order, i.e.: Created First → Created Last");
+                            });
+                        });
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(200, 190, 164))
+                        .inner_margin(egui::Margin::symmetric(5., 5.))
+                        .outer_margin(egui::Margin::symmetric(5., 5.))
+                        .show(ui, |ui| {
+                            ui.allocate_ui_with_layout([width-20.,0.].into(), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.add(egui::Checkbox::without_text(&mut self.incl_ignored));
+                                if ui.add(egui::Label::new(RichText::new("Dedupe ignored files").color(Color32::BLACK)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::Help).on_hover_text_at_pointer(RichText::new("Also delete duplicated non-image files hashed in database")).clicked() {
+                                    self.incl_ignored = !self.incl_ignored;
                                 }
-                            } else {
-                                if ui.button("CANCEL").clicked() {
-                                    self.show_hashing = false;
-                                    self.hashing_cancelled.cancel();
-                                }
+                            });
+                            ui.allocate_space([width-20., 0.].into());
+                        });
+                    hcenter_no_expand(ui, |ui| {
+                        if ui.button("OK?").clicked() {
+                            let hi = HashIndexer::new(self.db_pool.clone());
+                            let incl_ignored = self.incl_ignored;
+                            let (tx, rx) = mpsc::channel();
+                            let method = self.bin_dedup_method;
+                            self.bin_dupes_recv = Some(rx);
+                            self.rt.as_ref().unwrap().spawn(async move {
+                                hi.find_bindupes(incl_ignored, method, tx).await;
+                            });
+                            self.popover = PopOvers::BinaryDedup(BinDedupStep::Loading);
+                        }
+                    });
+                });
+            },
+            PopOvers::BinaryDedup(BinDedupStep::Loading) => {
+                let mut drop_recv = false;
+                match &self.bin_dupes_recv {
+                    Some(rx) => {
+                        match rx.try_recv() {
+                            Ok(msg) => match msg {
+                                    BinDupeMessage::NewSet => self.bin_dupes.push(HashSet::new()),
+                                    BinDupeMessage::Entry(path) => { self.bin_dupes.last_mut().expect("Tried inserting to bin_dupes before creating HashSet").insert(path); },
+                                },
+                            Err(TryRecvError::Empty) => (),
+                            Err(TryRecvError::Disconnected) => {
+                                drop_recv = true;
                             }
+                        }
+                    },
+                    None => {
+                        self.popover = PopOvers::BinaryDedup(BinDedupStep::ReviewFilelist);
+                    },
+                }
+                if drop_recv { self.bin_dupes_recv = None };
+                popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
+                        hcenter_no_expand(ui, |ui| {ui.separator();});
+                        ui.colored_label(Color32::BLACK, "Which duplicate should be kept:");
+                        let width = ui.min_size().x;
+                        egui::Frame::none()
+                        .fill(Color32::from_rgb(200, 190, 164))
+                        .inner_margin(egui::Margin::symmetric(5., 5.))
+                        .outer_margin(egui::Margin::symmetric(5., 5.))
+                        .show(ui, |ui| {
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::CreatedFirst,   RichText::new("Created first").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::ModifiedFirst,  RichText::new("Modified least recently").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::NameShortest,   RichText::new("Shortest name").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::PathShallowest, RichText::new("Shallowest path").color(Color32::BLACK));
+                            ui.radio_value(&mut self.bin_dedup_method, KeepWhichFile::PathShortest,   RichText::new("Shortest path").color(Color32::BLACK));
+                            ui.allocate_space([width-20., 0.].into());
+                            hcenter_no_expand(ui, |ui| {
+                                ui.separator();
+                                ui.checkbox(&mut self.bin_dedup_method_reversed, "Reverse order").on_hover_text_at_pointer("Switches order, i.e.: Created First → Created Last");
+                            });
+                        });
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(200, 190, 164))
+                        .inner_margin(egui::Margin::symmetric(5., 5.))
+                        .outer_margin(egui::Margin::symmetric(5., 5.))
+                        .show(ui, |ui| {
+                            ui.allocate_ui_with_layout([width-20.,0.].into(), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.add(egui::Checkbox::without_text(&mut self.incl_ignored));
+                                if ui.add(egui::Label::new(RichText::new("Dedupe ignored files").color(Color32::BLACK)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::Help).on_hover_text_at_pointer(RichText::new("Also delete duplicated non-image files hashed in database")).clicked() {
+                                    self.incl_ignored = !self.incl_ignored;
+                                }
+                            });
+                        ui.allocate_space([width-20., 0.].into());
                         });
                     });
-            });
-        };
+                    hcenter_no_expand(ui, |ui| {
+                        ui.label(RichText::new({
+                            match ui.input(|i| i.time as usize) % 4 {
+                                0 => "(Loading    )",
+                                1 => "(Loading .  )",
+                                2 => "(Loading .. )",
+                                3 => "(Loading ...)",
+                                _ => "what time is it?!",
+                            }
+                        }).monospace().color(Color32::BLACK));
+                        ctx.request_repaint();
+                    });
+                });
+            },
+            PopOvers::BinaryDedup(BinDedupStep::ReviewFilelist) => {
+                popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
+                    ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
+                    hcenter_no_expand(ui, |ui| {ui.separator();});
+                    egui::ScrollArea::both().max_height(270.).max_width(270.).show(ui, |ui| {
+                        for bindup_set in &self.bin_dupes {
+                            ui.horizontal(|ui| {
+                                for entry in bindup_set {
+                                    ui.label(entry.to_string_lossy().to_string());
+                                }
+                            });
+                            ui.allocate_space([0.,5.].into());
+                        }
+                    });
+                });
+            }
+            _ => panic!(),
+        }
     }
+}
+
+fn hcenter_no_expand<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+            ui.allocate_ui_with_layout([ui.min_size()[0], 0.].into(), egui::Layout::top_down(egui::Align::Center), add_contents)
+}
+
+fn popover_frame<R>(id: impl Into<egui::Id>, ctx: &egui::Context, size: Option<Vec2>, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    egui::Area::new(id).movable(false).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.,0.]).show(ctx, |ui| {
+        egui::Frame::none()
+            .fill(egui::Color32::GRAY)
+            .stroke(egui::Stroke::new(3., egui::Color32::BLACK))
+            .rounding(egui::Rounding::same(4.))
+            .inner_margin(egui::Margin::symmetric(3., 3.))
+            .show(ui, |ui| {
+                if let Some(size) = size {
+                    ui.set_max_size(size);
+                    let ret = add_contents(ui);
+                    ui.allocate_space(ui.available_size());
+                    ret
+                } else {
+                    add_contents(ui)
+                }
+            }).inner
+    })
 }
 
 fn aspect_fit(img_size: impl Into<Vec2>, fit_size: impl Into<Vec2>) -> Vec2 {
@@ -681,17 +825,16 @@ fn aspect_fit(img_size: impl Into<Vec2>, fit_size: impl Into<Vec2>) -> Vec2 {
 
 impl eframe::App for IndexingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::Area::new("mainarea").enabled(!(self.show_library_man||self.show_dialog_err||self.show_hashing)).show(ctx, |ui| self.deduplication_win(ui));
-        });
-        self.watch_dir_manager_win(ctx);
-        self.hashing_progress_win(ctx);
-        let scr_size = ctx.screen_rect().max;
-        let scr_size = egui::Pos2 { x: (scr_size.x - 200.)/2., y: (scr_size.y - 200.)/2.};
-        egui::Window::new("dialog_error").default_pos(scr_size).open(&mut self.show_dialog_err).fixed_size([200.,200.]).show(ctx, |ui| {
-            ui.colored_label(egui::Color32::RED, "ERROR: no system dialog found");
-        });
+        egui::Area::new("mainarea")
+            .enabled(self.popover == PopOvers::None)
+            .show(ctx, |ui| self.deduplication_win(ui));
 
+        match self.popover {
+            PopOvers::BinaryDedup(_) => self.binary_dedup_win(ctx),
+            PopOvers::HashingDbUpdate => self.hashing_progress_win(ctx),
+            PopOvers::LibraryManager => self.watch_dir_manager_win(ctx),
+            PopOvers::None => ()
+        }
     }
 
     fn on_exit(&mut self, _ctx: Option<&eframe::glow::Context>) {

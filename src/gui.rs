@@ -29,12 +29,26 @@ pub enum KeepWhichFile {
     PathShallowest, // least directories deep
 }
 
+impl KeepWhichFile {
+    pub fn get_query(&self) -> String {
+        match self {
+            Self::CreatedFirst => "ctime",
+            Self::ModifiedFirst => "mtime",
+            Self::PathShortest => "LENGTH(fullpath)",
+            Self::NameShortest => "LENGTH(filename)",
+            Self::PathShallowest => "dircnt",
+        }.to_string()
+    }
+}
+
 #[derive(PartialEq)]
 enum BinDedupStep {
     SelectMethod,
     Loading,
     ReviewFilelist,
-    _Deletion,
+    WarnConfirm,
+    Deletion,
+    ReviewDeleted,
 }
 
 pub enum BinDupeMessage {
@@ -63,9 +77,11 @@ pub struct IndexingGui {
     watched_image_count: Arc<AtomicI64>,
     bin_dedup_method: KeepWhichFile,
     bin_dedup_method_reversed: bool,
-    bin_dupes: Vec<HashSet<PathBuf>>,
+    bin_dupes: Vec<Vec<PathBuf>>,
     bin_dupes_recv: Option<mpsc::Receiver<BinDupeMessage>>,
     incl_ignored: bool,
+    which_set: usize,
+    deleted_file_cnt: usize,
     // bin_dedup_step: BinDedupStep,
 }
 
@@ -96,6 +112,8 @@ impl IndexingGui {
             bin_dupes: vec![],
             bin_dupes_recv: None,
             incl_ignored: false,
+            which_set: 0,
+            deleted_file_cnt: 0,
             // bin_dedup_step: BinDedupStep::SelectMethod,
         };
 
@@ -205,121 +223,72 @@ impl IndexingGui {
     }
 
     fn spawn_load_filelist(&mut self) {
-        if let Ok(lock) = self.watched_dirs.read() {
-            let (tx,rx) = std::sync::mpsc::channel::<PathBuf>();
-            self.filelist_recv = Some(rx);
-            let mut fut_set = FuturesUnordered::new();
-            for dir in lock.iter() {
-                if !dir.is_dir() {
-                    eprintln!("{} is not a directory!!", dir.to_string_lossy());
-                    continue
-                }
-                let tx = tx.clone();
-                let dir = dir.to_owned();
-                fut_set.push(async move {
-                    let mut dirlist = vec![dir];
-                    while let Some(dir) = dirlist.pop() {
-                        if let Ok(entries) = dir.read_dir() {
-                            let entries: Vec<std::fs::DirEntry> = entries.into_iter().flatten().collect();
-                            for entry in entries {
-                                let ft = entry.file_type().unwrap();
-                                if ft.is_file() {
-                                    if tx.send(entry.path()).is_err() {
-                                        eprintln!("Error: mpsc closed before receiving {}", entry.path().to_string_lossy());
-                                    }
-                                } else if ft.is_dir() {
-                                    dirlist.push(entry.path());
-                                } else {
-                                    eprintln!("Can't interpret filetype of: {}", entry.path().to_string_lossy());
+        println!("Spawned filelist loading");
+        self.filelist = HashSet::new();
+        let lock = self.watched_dirs.read().unwrap(); 
+        let (tx,rx) = std::sync::mpsc::channel::<PathBuf>();
+        self.filelist_recv = Some(rx);
+        let mut fut_set = FuturesUnordered::new();
+        for dir in lock.iter() {
+            if !dir.is_dir() {
+                eprintln!("{} is not a directory!!", dir.to_string_lossy());
+                continue
+            }
+            let tx = tx.clone();
+            let dir = dir.to_owned();
+            fut_set.push(async move {
+                let mut dirlist = vec![dir];
+                while let Some(dir) = dirlist.pop() {
+                    if let Ok(entries) = dir.read_dir() {
+                        let entries: Vec<std::fs::DirEntry> = entries.into_iter().flatten().collect();
+                        for entry in entries {
+                            let ft = entry.file_type().unwrap();
+                            if ft.is_file() {
+                                if tx.send(entry.path()).is_err() {
+                                    eprintln!("Error: mpsc closed before receiving {}", entry.path().to_string_lossy());
                                 }
+                            } else if ft.is_dir() {
+                                dirlist.push(entry.path());
+                            } else {
+                                eprintln!("Can't interpret filetype of: {}", entry.path().to_string_lossy());
                             }
                         }
                     }
-                })
-            }
-            let ct = self.hashing_cancelled.clone();
-            self.rt.as_ref().unwrap().spawn(async move {
-                while let Some(_) = fut_set.next().await{ if ct.is_cancelled() { break } }
-            });
+                }
+            })
         }
+        let ct = self.hashing_cancelled.clone();
+        self.rt.as_ref().unwrap().spawn(async move {
+            while let Some(_) = fut_set.next().await{ if ct.is_cancelled() { break } }
+        });
     }
 
-    // async fn load_filelist(paths: Arc<RwLock<HashSet<PathBuf>>>) -> Vec<PathBuf> {
-    //     let paths = paths.read().unwrap();
-    //     let mut filelist = vec![];
-    //     for path in (*paths).iter() {
-    //         if path.is_dir() {
-    //             let mut dirlist: _ = vec![path.into()];
-    //             let mut found_files: _ = vec![];
-    //             while let Some(dir_to_check) = dirlist.pop() {
-    //                 match std::fs::read_dir(dir_to_check) {
-    //                     Ok(readdir) => {
-    //                         for entry in readdir {
-    //                             if let Ok(entry) = entry {
-    //                                 if let Ok(ft) = entry.file_type() {
-    //                                     if ft.is_dir() {
-    //                                         dirlist.push(entry.path());
-    //                                     } else if ft.is_file() {
-    //                                         found_files.push(entry.path());
-    //                                     }
-    //                                 }
-    //                             }
-    //                         }
-    //                     },
-    //                     Err(error) => {
-    //                         if found_files.len() == 0 {
-    //                             panic!("{}", error);
-    //                         } else {
-    //                             eprintln!("{}", error);
-    //                         }
-    //                     },
-    //                 }
-    //             }
-    //             filelist.append(&mut found_files);
-    //         }
-    //     }
-    //     filelist
-    // }
-
-    // async fn update_from_watched_dirs(watched_dirs: Arc<RwLock<Vec<PathBuf>>>, filelist: Arc<RwLock<Option<Vec<PathBuf>>>>, db_pool: sqlx::SqlitePool, hash_track: Arc<HashTracker>, cancel_token: CancellationToken) -> Result<(), anyhow::Error> {
-    //     let hi = HashIndexer::new(db_pool);
-    //     let mut tasknum = 0;
-    //     // let mut fut_set = vec!();
-    //     let mut fut_set = FuturesUnordered::new();
-    //     {
-    //         if let Ok(lock) = filelist.read() {
-    //             if let Some(filelist) = &*lock {
-    //                 for entry in filelist {
-    //                     let entry = entry.to_str().unwrap();
-    //                     fut_set.push(hi.update(String::from(entry), tasknum));
-    //                     tasknum += 1;
-    //                 }
-    //             }
-    //         } else {
-    //             eprintln!("Couldn't lock filelist!");
-    //         }
-    //     }
-    //     println!("Starting {} update tasks...", fut_set.len());
-    //     hash_track.to_hash.store(fut_set.len(), Relaxed);
-    //     tasknum = 0;
-    //     // let _ = futures::future::join_all(fut_set).await;
-    //     while let Some(result) = fut_set.next().await {
-    //                 tasknum += 1;
-    //                 hash_track.hashed.fetch_add(1, Relaxed);
-    //                 if cancel_token.is_cancelled() {
-    //                     return Err(anyhow::anyhow!("hashing futures cancelled before completion"));
-    //                 } else {
-    //                     match result {
-    //                         Ok(_) => {},
-    //                         Err(HashIndexError::Format) => {hash_track.bad_format.fetch_add(1, Relaxed);},
-    //                         Err(HashIndexError::Encoding) => {hash_track.bad_encode.fetch_add(1, Relaxed);},
-    //                         Err(_) => (),
-    //                     }
-    //                 }
-    //     }
-    //     println!("DB updates completed.");
-    //     Ok(())
-    // }
+    fn clean_missing(&mut self) {
+        let conn = self.db_pool.clone();
+        let cloned_list = self.filelist.clone();
+        self.rt.as_ref().unwrap().block_on(async move {
+            let stored_filelist: HashSet<PathBuf> = sqlx::query("SELECT * FROM entries").fetch_all(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().iter().map(|x| PathBuf::from(x.get::<String,_>("fullpath"))).collect();
+            let deleted_files: Vec<String> = stored_filelist.symmetric_difference(&cloned_list).map(|x| x.to_string_lossy().to_string()).collect();
+            let mut delete_builder: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new("DELETE FROM entries WHERE fullpath IN (");
+            let mut sep = delete_builder.separated(", ");
+            // print!("DELETE FROM entries WHERE fullpath IN (");
+            for file in deleted_files {
+                // print!("'{}', ", file);
+                sep.push_bind(file);
+            }
+            // println!(");");
+            sep.push_unseparated(");");
+            let delete_query = delete_builder.build();
+            // println!("{}", sqlx::Execute::sql(&delete_query));
+            match delete_query.execute(conn.acquire().await.unwrap().acquire().await.unwrap()).await {
+                Err(x) => eprintln!("{:?}", x),
+                Ok(x) => println!(">>> DELETED {} ENTRIES FROM DATABASE", x.rows_affected()),
+            }
+        });
+        self.popover = PopOvers::HashingDbUpdate;
+        self.filelist_loaded = false;
+        self.hashing_cancelled = CancellationToken::new();
+    }
 
     // fn spawn_find_dupes(rt_handle: &runtime::Handle, cancel_token: CancellationToken, db_pool: sqlx::SqlitePool, hash_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, bin_dupes: Arc<tokio::sync::RwLock<Vec<Vec<String>>>>, hamming_proximity: usize, done_flag: Arc<AtomicBool>) {
     //     rt_handle.spawn(async move {
@@ -329,7 +298,7 @@ impl IndexingGui {
     //     });
     // }
 
-    fn deduplication_win(&mut self, ui: &mut egui::Ui) {
+    fn main_win(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             egui::containers::Frame {
                 inner_margin: egui::style::Margin { left: 10., right: 10., top: 4., bottom: 4.},
@@ -362,13 +331,7 @@ impl IndexingGui {
                             self.hashing_cancelled = CancellationToken::new();
                         }
                         if ui.button("CLEAN MISSING").clicked() {
-                            let conn = self.db_pool.clone();
-                            let cloned_list = self.filelist.clone();
-                            self.rt.as_ref().unwrap().spawn(async move {
-                                let stored_filelist: HashSet<PathBuf> = sqlx::query("SELECT * FROM entries").fetch_all(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().iter().map(|x| PathBuf::from(x.get::<String,_>("filepath"))).collect();
-                                let deleted_files: Vec<String> = stored_filelist.difference(&cloned_list).map(|x| x.to_string_lossy().to_string()).collect();
-                                println!("Files missing from filesystem:\n{:?}", deleted_files);
-                            });
+                            self.clean_missing();
                         }
                     });
                 });
@@ -443,13 +406,6 @@ impl IndexingGui {
         let mut dir_to_del: Option<PathBuf> = None;
         let mut dir_to_add = None;
         popover_frame("dirwatchwin", ctx, Some([400.,600.].into()), |ui| {
-            // ui.horizontal(|ui| {
-            //     egui::containers::TopBottomPanel::top("dir manager win panel").show_inside(ui, |ui| {
-            //         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            //             self.show_library_man = !ui.add(egui::Button::new(RichText::new("🗙").color(Color32::WHITE).strong().size(20.)).fill(Color32::LIGHT_RED)).clicked();
-            //         });
-            //     });
-            // });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Drag and drop directories to add or").color(egui::Color32::BLACK));
                 ui.add_space(18.);
@@ -536,75 +492,77 @@ impl IndexingGui {
         }
     }
 
+    // call once a frame if !filelist_loaded
+    // will set self.filelist_loaded = true when complete
+    fn receive_filelist_entries(&mut self) {
+        if let Some(filelist_recv) = &self.filelist_recv { loop {
+            match filelist_recv.try_recv() {
+                Ok(filename) => {self.filelist.insert(filename);},
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.filelist_loaded = true;
+                    self.hashing_complete = false;
+                    let mut fut_set = FuturesUnordered::new();
+                    self.rehashed_cnt = 0;
+                    let (tx, rx) = mpsc::channel();
+                    self.rehashed_cnt_recv = Some(rx);
+                    for entry in &self.filelist {
+                        // println!("looking at {}", entry.to_string_lossy());
+                        let db_pool = self.db_pool.clone();
+                        let entry = entry.to_owned();
+                        let tx = tx.clone();
+                        fut_set.push(async move {
+                            match HashIndexer::new(db_pool).update(entry.to_string_lossy().into()).await {
+                                Ok(_) => (),
+                                Err(HashIndexError::Encoding) => eprintln!("Encoding Error on file '{}'", entry.to_string_lossy()),
+                                // Enable for verbose skipping of non-image files
+                                // Err(HashIndexError::Format) => eprintln!("Skipping bad format file '{}'", entry.to_string_lossy()),
+                                Err(HashIndexError::Format) => (),
+                                Err(HashIndexError::MalformedDB) => eprintln!("MalformedDB Error on file '{}'", entry.to_string_lossy()),
+                                Err(HashIndexError::InsertDB) => eprintln!("InsertDB Error on file '{}'", entry.to_string_lossy()),
+                                Err(HashIndexError::FileNotFound) => println!("Skipping missing file '{}'", entry.to_string_lossy()),
+                                Err(HashIndexError::Other) => eprintln!("Other Error on file '{}'", entry.to_string_lossy()),
+                            }
+                            tx.send(1).unwrap();
+                        })
+                    }
+                    let ct = self.hashing_cancelled.clone();
+                    println!("started {} update tasks", fut_set.len());
+
+                    // let conn = self.db_pool.clone();
+                    // let cloned_list = self.filelist.clone();
+                    // self.rt.as_ref().unwrap().spawn(async move {
+                    //     let stored_filelist: HashSet<PathBuf> = sqlx::query("SELECT * FROM entries").fetch_all(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().iter().map(|x| PathBuf::from(x.get::<String,_>("filepath"))).collect();
+                    //     let deleted_files: Vec<String> = stored_filelist.difference(&cloned_list).map(|x| x.to_string_lossy().to_string()).collect();
+                    //     println!("Files missing from filesystem:\n{:?}", deleted_files);
+                    // });
+
+                    let wic = self.watched_image_count.clone();
+                    let conn = self.db_pool.clone();
+                    self.rt.as_ref().unwrap().spawn(async move {
+                        while let Some(_) = fut_set.next().await { if ct.is_cancelled() { break };}
+                        wic.store(sqlx::query("SELECT COUNT(*) FROM entries WHERE ignored = 0;").fetch_one(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().get::<i64,_>(0), Relaxed);
+                    });
+                    break
+                }
+            }
+        } }
+    }
+
     fn hashing_progress_win(&mut self, ctx: &egui::Context) {
         popover_frame("Hashing Progress Window", ctx, None, |ui| {
             if !self.filelist_loaded { match &self.filelist_recv {
-                Some(filelist_recv) => {
-                    loop {
-                        match filelist_recv.try_recv() {
-                            Ok(filename) => {self.filelist.insert(filename);},
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => {
-                                self.filelist_loaded = true;
-                                self.hashing_complete = false;
-                                let mut fut_set = FuturesUnordered::new();
-                                self.rehashed_cnt = 0;
-                                let (tx, rx) = mpsc::channel();
-                                self.rehashed_cnt_recv = Some(rx);
-                                for entry in &self.filelist {
-                                    println!("looking at {}", entry.to_string_lossy());
-                                    let db_pool = self.db_pool.clone();
-                                    let entry = entry.to_owned();
-                                    let tx = tx.clone();
-                                    fut_set.push(async move {
-                                        match HashIndexer::new(db_pool).update(entry.to_string_lossy().into()).await {
-                                            Ok(_) => (),
-                                            Err(HashIndexError::Encoding) => eprintln!("Encoding Error on file '{}'", entry.to_string_lossy()),
-                                            // Enable for verbose skipping of non-image files
-                                            // Err(HashIndexError::Format) => eprintln!("Skipping bad format file '{}'", entry.to_string_lossy()),
-                                            Err(HashIndexError::Format) => (),
-                                            Err(HashIndexError::MalformedDB) => eprintln!("MalformedDB Error on file '{}'", entry.to_string_lossy()),
-                                            Err(HashIndexError::InsertDB) => eprintln!("InsertDB Error on file '{}'", entry.to_string_lossy()),
-                                            Err(HashIndexError::Other) => eprintln!("Other Error on file '{}'", entry.to_string_lossy()),
-                                        }
-                                        tx.send(1).unwrap();
-                                    })
-                                }
-                                let ct = self.hashing_cancelled.clone();
-                                println!("started {} update tasks", fut_set.len());
-
-                                // let conn = self.db_pool.clone();
-                                // let cloned_list = self.filelist.clone();
-                                // self.rt.as_ref().unwrap().spawn(async move {
-                                //     let stored_filelist: HashSet<PathBuf> = sqlx::query("SELECT * FROM entries").fetch_all(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().iter().map(|x| PathBuf::from(x.get::<String,_>("filepath"))).collect();
-                                //     let deleted_files: Vec<String> = stored_filelist.difference(&cloned_list).map(|x| x.to_string_lossy().to_string()).collect();
-                                //     println!("Files missing from filesystem:\n{:?}", deleted_files);
-                                // });
-
-                                let wic = self.watched_image_count.clone();
-                                let conn = self.db_pool.clone();
-                                self.rt.as_ref().unwrap().spawn(async move {
-                                    while let Some(_) = fut_set.next().await { if ct.is_cancelled() { break };}
-                                    wic.store(sqlx::query("SELECT COUNT(*) FROM entries WHERE ignored = 0;").fetch_one(conn.acquire().await.unwrap().acquire().await.unwrap()).await.unwrap().get::<i64,_>(0), Relaxed);
-                                });
-                                break
-                            }
-                        }
-                    }
-                    while let Ok(filename) = filelist_recv.try_recv() {
-                        self.filelist.insert(filename);
-                    }
-                },
-                None => self.spawn_load_filelist()
+                Some(_) => self.receive_filelist_entries(),
+                None => self.spawn_load_filelist(),
                 }
             } else {
                 self.filelist_recv = None;
                 if let Some(recv) = &self.rehashed_cnt_recv {
-                    match recv.try_recv() {
+                    loop { match recv.try_recv() {
                         Ok(rx) => self.rehashed_cnt += rx,
-                        Err(TryRecvError::Empty) => (),
-                        Err(TryRecvError::Disconnected) => {self.hashing_complete = true},
-                    };
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {self.hashing_complete = true; break},
+                    }};
                 }
             } 
             ui.horizontal(|ui| {
@@ -642,8 +600,8 @@ impl IndexingGui {
     }
 
     fn binary_dedup_win(&mut self, ctx: &egui::Context) {
-        match self.popover {
-            PopOvers::BinaryDedup(BinDedupStep::SelectMethod) => {
+        if let PopOvers::BinaryDedup(step) = self.popover { match step { 
+            BinDedupStep::SelectMethod => {
                 popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
                     ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
                     hcenter_no_expand(ui, |ui| {ui.separator();});
@@ -684,29 +642,32 @@ impl IndexingGui {
                             let incl_ignored = self.incl_ignored;
                             let (tx, rx) = mpsc::channel();
                             let method = self.bin_dedup_method;
+                            let reversed = self.bin_dedup_method_reversed;
                             self.bin_dupes_recv = Some(rx);
                             self.rt.as_ref().unwrap().spawn(async move {
-                                hi.find_bindupes(incl_ignored, method, tx).await;
+                                hi.find_bindupes(incl_ignored, method, reversed, tx).await;
                             });
+                            // self.which_set = 0;
                             self.popover = PopOvers::BinaryDedup(BinDedupStep::Loading);
                         }
                     });
                 });
             },
-            PopOvers::BinaryDedup(BinDedupStep::Loading) => {
+            BinDedupStep::Loading => {
                 let mut drop_recv = false;
                 match &self.bin_dupes_recv {
                     Some(rx) => {
-                        match rx.try_recv() {
+                        loop { match rx.try_recv() {
                             Ok(msg) => match msg {
-                                    BinDupeMessage::NewSet => self.bin_dupes.push(HashSet::new()),
-                                    BinDupeMessage::Entry(path) => { self.bin_dupes.last_mut().expect("Tried inserting to bin_dupes before creating HashSet").insert(path); },
+                                    BinDupeMessage::NewSet => self.bin_dupes.push(vec![]),
+                                    BinDupeMessage::Entry(path) => { self.bin_dupes.last_mut().expect("Tried inserting to bin_dupes before creating HashSet").push(path); },
                                 },
-                            Err(TryRecvError::Empty) => (),
+                            Err(TryRecvError::Empty) => break,
                             Err(TryRecvError::Disconnected) => {
                                 drop_recv = true;
+                                break
                             }
-                        }
+                        } }
                     },
                     None => {
                         self.popover = PopOvers::BinaryDedup(BinDedupStep::ReviewFilelist);
@@ -763,23 +724,107 @@ impl IndexingGui {
                     });
                 });
             },
-            PopOvers::BinaryDedup(BinDedupStep::ReviewFilelist) => {
+            BinDedupStep::ReviewFilelist => {
                 popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
                     ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
                     hcenter_no_expand(ui, |ui| {ui.separator();});
-                    egui::ScrollArea::both().max_height(270.).max_width(270.).show(ui, |ui| {
-                        for bindup_set in &self.bin_dupes {
-                            ui.horizontal(|ui| {
-                                for entry in bindup_set {
-                                    ui.label(entry.to_string_lossy().to_string());
+                    ui.horizontal(|ui| { egui::Frame::none().fill(Color32::LIGHT_YELLOW).show(ui, |ui| { 
+                        if ui.button("<").clicked() && self.which_set > 0 {
+                            self.which_set -= 1;
+                        }
+                        ui.colored_label(Color32::BLACK, format!("{}/{}", self.which_set+1, self.bin_dupes.len()));
+                        if ui.button(">").clicked() && self.which_set+1 < self.bin_dupes.len() {
+                            self.which_set += 1;
+                        }});
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.popover = PopOvers::None;
+                            }
+                            if ui.button("Delete 'em!").clicked() {
+                                self.popover = PopOvers::BinaryDedup(BinDedupStep::WarnConfirm);
+                            }
+                        });
+                    });
+                    egui::Frame::none()
+                        .fill(Color32::LIGHT_GRAY)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(270.).max_width(270.).show(ui, |ui| {
+                            if self.bin_dupes.len() > 0 {
+                                for entry in &self.bin_dupes[self.which_set] {
+                                    ui.colored_label(Color32::BLACK, entry.to_string_lossy().to_string());
+                                }
+                            } else {
+                                ui.colored_label(Color32::DARK_GREEN, "No binary duplicates found!");
+                            }
+                            ui.allocate_space([0.,5.].into());
+                            });
+                        });
+                });
+            },
+            BinDedupStep::WarnConfirm => {
+                popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
+                    ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
+                    hcenter_no_expand(ui, |ui| {ui.separator();});
+                    let width = ui.min_size().x;
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+                        ui.allocate_space([width, 0.].into());
+                        ui.label(RichText::new("WARNING!").heading().color(Color32::RED));
+                        ui.label(RichText::new("Pressing continue will").heading().color(Color32::BLACK));
+                        ui.label(RichText::new("DELETE").heading().color(Color32::RED));
+                        ui.label(RichText::new(format!("{} files from disk", self.bin_dupes.iter().flatten().count())).heading().color(Color32::BLACK));
+                        ui.add_space(60.);
+                        ui.horizontal_centered(|ui| {
+                            if ui.button("Bye, files").clicked() {
+                                self.popover = PopOvers::BinaryDedup(BinDedupStep::Deletion);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel!").clicked() {
+                                    self.popover = PopOvers::None;
                                 }
                             });
-                            ui.allocate_space([0.,5.].into());
-                        }
+                        });
                     });
                 });
-            }
-            _ => panic!(),
+            },
+            BinDedupStep::Deletion => {
+                for set in &self.bin_dupes {
+                    println!("{}", set.len());
+                    assert!(set.len() >= 2);
+                    let mut set_iter = set.iter();
+                    println!("KEEP {}", set_iter.next().unwrap().to_string_lossy());
+                    for file in set_iter {
+                        std::fs::remove_file(file).unwrap();
+                        self.deleted_file_cnt += 1;
+                    }
+                }
+                self.filelist = HashSet::new();
+                self.filelist_loaded = false;
+                self.spawn_load_filelist();
+                self.popover = PopOvers::BinaryDedup(BinDedupStep::ReviewDeleted);
+            },
+            BinDedupStep::ReviewDeleted => {
+                popover_frame("Binary Deduplicator", ctx, Some([270.,270.].into()), |ui| {
+                    ui.label(RichText::new("Delete exact duplicates of images").text_style(egui::TextStyle::Heading).color(Color32::BLACK));
+                    hcenter_no_expand(ui, |ui| {ui.separator();});
+                    ui.label(RichText::new(format!("Deleted {} files.", self.deleted_file_cnt)).color(Color32::BLACK));
+                    if !self.filelist_loaded {
+                        self.receive_filelist_entries(); 
+                        ui.spinner();
+                    } else {
+                        ui.add_space(12.);
+                    }
+                    if ui.add_enabled(self.filelist_loaded, egui::Button::new("Accept the consequences\nof your actions")).clicked() {
+                        self.clean_missing();
+                    }
+                });
+            },
+        } }
+        match self.popover {
+            PopOvers::BinaryDedup(_) => (),
+            _ => {
+                self.bin_dupes = vec![];
+                self.which_set = 0;
+            },
         }
     }
 }
@@ -827,7 +872,7 @@ impl eframe::App for IndexingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::Area::new("mainarea")
             .enabled(self.popover == PopOvers::None)
-            .show(ctx, |ui| self.deduplication_win(ui));
+            .show(ctx, |ui| self.main_win(ui));
 
         match self.popover {
             PopOvers::BinaryDedup(_) => self.binary_dedup_win(ctx),

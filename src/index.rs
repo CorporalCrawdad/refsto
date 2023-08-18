@@ -17,6 +17,7 @@ pub enum HashIndexError {
     Encoding,
     MalformedDB,
     InsertDB,
+    FileNotFound,
     Other,
 }
 
@@ -32,6 +33,7 @@ impl HashIndexer {
         let mut file_bytes = None;
         let meta = { match metadata(fullpath).await {
             Ok(x) => x,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Err(HashIndexError::FileNotFound),
             Err(e) => {
                 eprintln!("{}: {:?}", fullpath, e);
                 return Err(HashIndexError::Other)
@@ -106,7 +108,7 @@ impl HashIndexer {
         res
     }
 
-    pub async fn find_bindupes(&self, incl_ignored: bool, _method: KeepWhichFile, tx: std::sync::mpsc::Sender<BinDupeMessage>) {
+    pub async fn find_bindupes(&self, incl_ignored: bool, method: KeepWhichFile, reversed: bool, tx: std::sync::mpsc::Sender<BinDupeMessage>) {
         let mut conn = loop {
             if let Ok(acquisition) = self.db_pool.acquire().await {
                 break acquisition;
@@ -127,12 +129,21 @@ impl HashIndexer {
                 .iter().map(|x| x.get::<i64,_>("xxhash")).collect();
 
         for i64_xxhash in collision_rows {
+            println!("Set of xxhash: {}", i64_xxhash);
             tx.send(BinDupeMessage::NewSet).unwrap();
-            sqlx::query("SELECT filepath FROM entries WHERE xxhash = ?").bind(i64_xxhash)
-                    .fetch_all(&mut *conn).await.unwrap().iter()
-                    .for_each(|x| tx.send(BinDupeMessage::Entry(PathBuf::from(x.get::<String,_>("filepath")))).unwrap());
+            sqlx::query(
+                format!(
+                        "SELECT fullpath FROM entries WHERE xxhash = ? ORDER BY {}{};",
+                        method.get_query(),
+                        {if reversed {" DESC"} else {""}}
+                    )
+                    .as_str()
+                )
+                .bind(i64_xxhash)
+                .fetch_all(&mut *conn).await.unwrap().iter()
+                .for_each(|x| { println!("{}\t{}", i64_xxhash, x.get::<String,_>("fullpath")); tx.send(BinDupeMessage::Entry(PathBuf::from(x.get::<String,_>("fullpath")))).unwrap();});
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+        // tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
     }
 
     //     // get hash dupes
